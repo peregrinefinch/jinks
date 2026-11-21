@@ -9,15 +9,16 @@
 Jinks builds static sites from Markdown, TOML, and Tuck. Give a site a theme,
 preview changes as you write, and publish the generated files anywhere.
 
-From a Jinks checkout with [Pooka](https://pooka.run/) and Erlang installed:
+[Website](https://peregrinefinch.github.io/jinks-website/) · [Installation and docs](https://peregrinefinch.github.io/jinks-website/docs/)
+
+With Jinks installed:
 
 ```sh
-pooka deps download
-pooka run -- init my-site
-pooka run -- serve my-site
+jinks init my-site
+jinks serve my-site
 ```
 
-Run `pooka run -- build my-site` to write the site to `my-site/public/`.
+Run `jinks build my-site` to write the site to `my-site/public/`.
 
 ## Licence
 
