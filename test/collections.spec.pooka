@@ -1,0 +1,289 @@
+// SPDX-License-Identifier: Apache-2.0
+module collections_test
+
+import jinks/collection
+import jinks/config
+import jinks/content
+import jinks/date
+import jinks/route
+import jinks/section
+import jinks/value
+import poke/should
+import pooka/json
+import pooka/list
+import pooka/string
+import tome
+
+spec() -> section.Spec {
+  section.Spec(
+    "posts",
+    "posts",
+    "date",
+    True,
+    "/:year/:month/:day/:slug/",
+    tome.TTable([])
+  )
+}
+
+page(name: String, title: String, day: String) -> content.Page {
+  should.be_ok(
+    content.parse_with(
+      name,
+      "---\ntitle = \"" + title + "\"\ndate = " + day + "\n---\n# Hello",
+      Some(spec())
+    )
+  )
+}
+
+test "publication dates validate leap years and reject timestamps or malformed days" {
+  loop valid in ["2024-02-29", "2000-02-29", "2020-12-31"] {
+    let _ = should.be_ok(date.parse(valid))
+  }
+  loop invalid in [
+    "1900-02-29",
+    "2023-02-29",
+    "0000-01-01",
+    "2020-13-01",
+    "2020-04-31",
+    "2020-1-01",
+    "2020-01-01T00:00:00Z"
+  ] {
+    let _ = should.be_error(date.parse(invalid))
+  }
+}
+
+test "permalinks produce safe filenames and encoded public URLs" {
+  should.equal(route.permalink("/caf%C3%A9/"), Ok("café/index.html"))
+  should.equal(route.url("café/index.html"), "/caf%C3%A9/")
+  should.equal(route.permalink("/404.html"), Ok("404.html"))
+  should.equal(
+    route.url("notes/myindex.html/index.html"),
+    "/notes/myindex.html/"
+  )
+  loop invalid in [
+    "relative",
+    "//outside",
+    "/../secret",
+    "/%2e%2e/secret",
+    "/a?b",
+    "/a#b",
+    "/%00",
+    "/__jinks/events"
+  ] {
+    let _ = should.be_error(route.permalink(invalid))
+  }
+}
+
+test "collection settings reject typos, invalid types and ambiguous paths" {
+  loop source in [
+    "collections = false",
+    "[collections.posts]\nsort = \"random\"",
+    "[collections.posts]\ndirection = \"sideways\"",
+    "[collections.posts]\npath = \"../outside\"",
+    "[collections.posts]\ntypo = true",
+    "[collections.all]",
+    "[collections.posts]\npath = \"notes\"\n[collections.other]\npath = \"NOTES\""
+  ] {
+    let _ = should.be_error(config.parse(source))
+  }
+}
+
+test "the nearest configured collection wins on directory boundaries" {
+  let site = should.be_ok(
+    config.parse(
+      "[collections.guides]\npath = \"guides\"\n[collections.advanced]\npath = \"guides/advanced\""
+    )
+  )
+  should.equal(
+    should.be_some(section.find(site.collections, "guides/advanced/owl.md")).name,
+    "advanced"
+  )
+  should.equal(
+    should.be_some(section.find(site.collections, "guides/start.md")).name,
+    "guides"
+  )
+  should.be_none(section.find(site.collections, "guides-extra/start.md"))
+}
+
+test "defaults merge nested parameters and explicit metadata wins" {
+  let defaults = should.be_ok(
+    tome.parse(
+      "layout = \"post\"\n[params]\nkind = \"note\"\n[params.palette]\npaper = \"cream\"\nink = \"brown\""
+    )
+  )
+  let shelf = section.Spec("posts", "posts", "path", False, "", defaults)
+  let parsed = should.be_ok(
+    content.parse_with(
+      "posts/owl.md",
+      "---\ntitle = \"Owl\"\n[params.palette]\nink = \"purple\"\n---\nHi",
+      Some(shelf)
+    )
+  )
+  should.equal(parsed.layout, "post.html.tuck")
+  should.equal(
+    json.path(parsed.params, ["palette", "ink"]),
+    Some(json.JString("purple"))
+  )
+  should.equal(
+    json.path(parsed.params, ["palette", "paper"]),
+    Some(json.JString("cream"))
+  )
+  should.equal(json.get(parsed.params, "kind"), Some(json.JString("note")))
+}
+
+test "date collections sort deterministically and expose nonrecursive neighbours" {
+  let first = page("posts/a.md", "First", "2020-01-02")
+  let tied = page("posts/b.md", "Second", "2020-01-02")
+  let old = page("posts/c.md", "Old", "2019-12-31")
+  let pages = [old, tied, first]
+  let sorted = should.be_ok(collection.members(spec(), pages))
+  should.equal(
+    list.map(sorted, fn(p) { p.name }),
+    ["posts/a.md", "posts/b.md", "posts/c.md"]
+  )
+  let context = should.be_ok(collection.page_context(tied, [spec()], pages))
+  should.equal(
+    json.path(context, ["previous", "title"]),
+    Some(json.JString("First"))
+  )
+  should.equal(json.path(context, ["next", "title"]), Some(json.JString("Old")))
+  should.equal(json.path(context, ["previous", "previous"]), None)
+  should.equal(
+    json.get(
+      should.be_ok(collection.page_context(first, [spec()], pages)),
+      "previous"
+    ),
+    Some(json.JNull())
+  )
+}
+
+test "date sorting requires dates and explicit page permalinks override collection rules" {
+  let undated = should.be_ok(
+    content.parse_with(
+      "posts/owl.md",
+      "# Owl",
+      Some(section.Spec("posts", "posts", "date", True, "", tome.TTable([])))
+    )
+  )
+  let _ = should.be_error(collection.members(spec(), [undated]))
+  let explicit = should.be_ok(
+    content.parse_with(
+      "posts/owl.md",
+      "---\npermalink = \"/about/\"\n---\nHi",
+      Some(spec())
+    )
+  )
+  should.equal(explicit.output, "about/index.html")
+  let _ = should.be_error(
+    content.parse_with("posts/owl.md", "# Hi", Some(spec()))
+  )
+}
+
+test "slug changes and dated permalink placeholders preserve canonical URLs" {
+  let dated = page("posts/owl.md", "Owl", "2020-02-29")
+  should.equal(dated.output, "2020/02/29/owl/index.html")
+  let slugged = should.be_ok(
+    content.parse("notes/old.md", "---\nslug = \"new owl\"\n---\nHi")
+  )
+  should.equal(route.url(slugged.output), "/notes/new%20owl/")
+  let _ = should.be_error(
+    content.parse("old.md", "---\nslug = \"../secret\"\n---\nHi")
+  )
+}
+
+test "metadata errors retain front matter line and message" {
+  let error = should.be_error(
+    content.parse("bad.md", "---\ntitle = [\n---\nHi")
+  )
+  should.be_true(string.contains(error, "bad.md:"))
+  should.be_false(string.contains(error, "invalid TOML front matter"))
+}
+
+test "parameter arrays replace defaults and scalar values replace objects" {
+  let defaults = json.JObject(
+    [
+      #("tags", json.JArray([json.JString("old")])),
+      #("palette", json.JObject([]))
+    ]
+  )
+  let override = json.JObject(
+    [
+      #("tags", json.JArray([json.JString("new")])),
+      #("palette", json.JString("simple"))
+    ]
+  )
+  let result = value.merge(defaults, override)
+  should.equal(
+    json.get(result, "tags"),
+    Some(json.JArray([json.JString("new")]))
+  )
+  should.equal(json.get(result, "palette"), Some(json.JString("simple")))
+}
+
+test "guide order and title sorting use path tie breakers" {
+  let shelf = section.Spec(
+    "guides",
+    "guides",
+    "order",
+    False,
+    "",
+    tome.TTable([])
+  )
+  let a = should.be_ok(
+    content.parse_with(
+      "guides/a.md",
+      "---\ntitle = \"Zebra\"\norder = 2\n---\nHi",
+      Some(shelf)
+    )
+  )
+  let b = should.be_ok(
+    content.parse_with(
+      "guides/b.md",
+      "---\ntitle = \"Apple\"\norder = 1\n---\nHi",
+      Some(shelf)
+    )
+  )
+  let sorted = should.be_ok(collection.members(shelf, [a, b]))
+  should.equal(list.map(sorted, fn(p) { p.title }), ["Apple", "Zebra"])
+  let by_title = section.Spec(
+    "guides",
+    "guides",
+    "title",
+    True,
+    "",
+    tome.TTable([])
+  )
+  should.equal(
+    list.map(should.be_ok(collection.members(by_title, [b, a])), fn(p) {
+      p.title
+    }),
+    ["Zebra", "Apple"]
+  )
+}
+
+test "visibility settings reject misspellings and non-Boolean flags" {
+  loop source in [
+    "build = false",
+    "[build]\ndrafts = 1",
+    "[build]\nfuture = \"yes\"",
+    "[build]\nfutures = true",
+    "[collections.posts]\npermalink = \"/:unknown/\""
+  ] {
+    let _ = should.be_error(config.parse(source))
+  }
+}
+
+test "device names and Windows path aliases are rejected on every platform" {
+  loop path in [
+    "/CON/",
+    "/nul.html",
+    "/com1/",
+    "/LPT9/",
+    "/owl%3F/",
+    "/owl%20/"
+  ] {
+    let _ = should.be_error(route.permalink(path))
+  }
+  let _ = should.be_error(config.parse("output-dir = \"NUL\""))
+  should.equal(route.permalink("/context/"), Ok("context/index.html"))
+}

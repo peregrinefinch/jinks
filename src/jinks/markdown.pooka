@@ -1,0 +1,227 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// Headings receive their addresses from the parsed tree, not a search through
+//// rendered HTML. The same walk supplies the outline, including nested quotes
+//// and lists, while code fences remain opaque to heading recognition.
+module markdown
+
+import marksy
+import marksy/ast
+import marksy/syntax
+import marksy/html
+import jinks/highlight
+import pooka/dict
+import pooka/int
+import pooka/json
+import pooka/list
+import pooka/string
+
+author(source: String, raw_html: Bool) -> #(String, json.Json) {
+  let options = html.Options(
+    match raw_html {
+      True -> html.RawHtml.Preserve
+      False -> html.RawHtml.Escape
+    },
+    False
+  )
+  let #(blocks, _, outline) = walk(
+    marksy.parse_with(source, syntax.gfm()).blocks,
+    options,
+    dict.empty(),
+    []
+  )
+  #(
+    html.render_with(
+      ast.Document(blocks),
+      html.Options(html.RawHtml.Preserve, False)
+    ),
+    json.JArray(list.reverse(outline))
+  )
+}
+
+walk(
+  blocks: List(ast.Block),
+  options: html.Options,
+  used: dict.Dict(String, Bool),
+  outline: List(json.Json)
+) -> #(List(ast.Block), dict.Dict(String, Bool), List(json.Json)) {
+  let state = list.fold(
+    blocks,
+    #([], used, outline),
+    fn(
+      state: #(List(ast.Block), dict.Dict(String, Bool), List(json.Json)),
+      block
+    ) {
+      match block {
+        ast.Heading(level, inlines, span) -> {
+          let rendered = html.inlines(inlines, options)
+          let text = plain(inlines)
+          let id = unique(slug(text), state.1, 0)
+          let heading: ast.Block = ast.RawBlock(
+            "<h" + int.to_string(level) + " id=\"" + html.escape(id) + "\">" + rendered + "</h" + int.to_string(
+              level
+            ) + ">\n",
+            span
+          )
+          #(
+            [heading, ..state.0],
+            state.1.insert(id, True),
+            [
+              json.JObject(
+                [
+                  #("id", json.JString(id)),
+                  #("text", json.JString(text)),
+                  #("level", json.JInt(level))
+                ]
+              ),
+              ..state.2
+            ]
+          )
+        }
+        ast.CodeBlock(code, info, span) -> {
+          let language = match list.first(string.split(info, " ")) {
+            Some(language) -> language
+            None -> ""
+          }
+          let rendered = "<pre class=\"code\" data-lang=\"" + html.escape(
+            language
+          ) + "\"><code class=\"language-" + html.escape(language) + "\">" + highlight.render(
+            code,
+            language
+          ) + "</code></pre>\n"
+          #([ast.RawBlock(rendered, span), ..state.0], state.1, state.2)
+        }
+        ast.BlockQuote(children, span) -> {
+          let #(children, used, outline) = walk(
+            children,
+            options,
+            state.1,
+            state.2
+          )
+          #([ast.BlockQuote(children, span), ..state.0], used, outline)
+        }
+        ast.ListBlock(ordered, start, tight, items, span) -> {
+          let nested = list.fold(
+            items,
+            #([], state.1, state.2),
+            fn(nested, item) {
+              let #(children, used, outline) = walk(
+                item.blocks,
+                options,
+                nested.1,
+                nested.2
+              )
+              #(
+                [ast.ListItem(children, item.span, item.checked), ..nested.0],
+                used,
+                outline
+              )
+            }
+          )
+          #(
+            [
+              ast.ListBlock(ordered, start, tight, list.reverse(nested.0), span),
+              ..state.0
+            ],
+            nested.1,
+            nested.2
+          )
+        }
+        ast.Paragraph(inlines, span) -> #(
+          [ast.Paragraph(safe_inlines(inlines, options), span), ..state.0],
+          state.1,
+          state.2
+        )
+        ast.Table(alignments, header, rows, span) -> #(
+          [
+            ast.Table(
+              alignments,
+              list.map(header, fn(cell) { safe_inlines(cell, options) }),
+              list.map(rows, fn(row) {
+                list.map(row, fn(cell) { safe_inlines(cell, options) })
+              }),
+              span
+            ),
+            ..state.0
+          ],
+          state.1,
+          state.2
+        )
+        ast.RawBlock(source, span) -> {
+          let source = match options.raw_html {
+            html.RawHtml.Preserve -> source
+            _ -> html.escape(source)
+          }
+          #([ast.RawBlock(source, span), ..state.0], state.1, state.2)
+        }
+        _ -> #([block, ..state.0], state.1, state.2)
+      }
+    }
+  )
+  #(list.reverse(state.0), state.1, state.2)
+}
+
+// Generated markup is trusted, while authored raw nodes were handled above.
+// Inline authored tags still follow the selected policy in html.inlines.
+slug(text: String) -> String {
+  string.lowercase(text) |> string.split("") |> list.filter(fn(char) {
+    !string.contains("!\"#$%&'()*+,./:;<=>?@[\\]^`{|}~", char)
+  }) |> string.join("") |> string.replace(" ", "-")
+}
+
+unique(base: String, used: dict.Dict(String, Bool), number: Int) -> String {
+  let candidate = match number {
+    0 -> base
+    _ -> base + "-" + int.to_string(number)
+  }
+  match used.has_key(candidate) {
+    True -> unique(base, used, number + 1)
+    False -> candidate
+  }
+}
+
+plain(inlines: List(ast.Inline)) -> String {
+  list.map(inlines, fn(inline) {
+    match inline {
+      ast.Text(value) -> value
+      ast.SourceInline(value) -> value
+      ast.Code(value) -> value
+      ast.Emphasis(children) -> plain(children)
+      ast.Strong(children) -> plain(children)
+      ast.Strikethrough(children) -> plain(children)
+      ast.Link(children, _, _) -> plain(children)
+      ast.Image(children, _, _) -> plain(children)
+      ast.SoftBreak() -> " "
+      ast.HardBreak() -> " "
+      ast.RawInline(_) -> ""
+    }
+  }) |> string.join("")
+}
+
+safe_inlines(inlines: List(ast.Inline), options: html.Options) -> List(
+  ast.Inline
+) {
+  list.map(inlines, fn(inline) {
+    match inline {
+      ast.RawInline(source) if options.raw_html != html.RawHtml.Preserve -> ast.Text(
+        source
+      )
+      ast.Emphasis(children) -> ast.Emphasis(safe_inlines(children, options))
+      ast.Strong(children) -> ast.Strong(safe_inlines(children, options))
+      ast.Strikethrough(children) -> ast.Strikethrough(
+        safe_inlines(children, options)
+      )
+      ast.Link(children, destination, title) -> ast.Link(
+        safe_inlines(children, options),
+        destination,
+        title
+      )
+      ast.Image(children, destination, title) -> ast.Image(
+        safe_inlines(children, options),
+        destination,
+        title
+      )
+      _ -> inline
+    }
+  })
+}

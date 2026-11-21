@@ -1,0 +1,74 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// A small command line for a growing home of pages. Command failures leave
+//// through stderr with a failing status, so shell scripts can trust the door.
+module jinks
+
+import arglet
+import jinks/log
+import pooka/time
+import jinks/provider
+import jinks/author
+import jinks/serve
+import jinks/build_cli
+import jinks/scaffold
+import pooka/io
+import pooka/process
+
+main() {
+  main_with([])
+}
+
+main_with(providers: List(provider.Provider)) {
+  let args = arglet.arguments()
+  let started = time.monotonic_now()
+  match command_with(args, providers) {
+    Ok(message) -> {
+      let elapsed = time.duration_between(started, time.monotonic_now()).as_milliseconds()
+      let _ = io.println(log.success(message, elapsed, log.colours(args)))
+      Nil
+    }
+    Error(message) -> {
+      let _ = io.eprintln("error: " + message)
+      process.exit(1)
+    }
+  }
+}
+
+command(args: List(String)) -> Result(String, String) {
+  command_with(args, [])
+}
+
+command_with(args: List(String), providers: List(provider.Provider)) -> Result(
+  String,
+  String
+) {
+  let args = log.arguments(args)
+  match args {
+    [] -> Ok(help())
+    ["--help"] -> Ok(help())
+    ["-h"] -> Ok(help())
+    ["help", name] -> command_with([name, "--help"], providers)
+    ["init", "-h"] -> command(["init", "--help"])
+    ["serve", "-h"] -> command(["serve", "--help"])
+    ["clean", "-h"] -> command(["clean", "--help"])
+    ["serve", "--help"] -> Ok(serve.help())
+    ["serve", ..arguments] -> serve.run_with(arguments, providers)
+    ["init", "--help"] -> Ok(
+      "Usage: jinks init <directory>\nCreate config.toml, content, and a minimal theme with theme.toml."
+    )
+    ["new", ..arguments] -> author.run(arguments)
+    ["build", ..arguments] -> build_cli.run_with(arguments, False, providers)
+    ["check", ..arguments] -> build_cli.run_with(arguments, True, providers)
+    ["clean", ..arguments] -> build_cli.clean(arguments)
+    ["init", root] -> {
+      let _ = scaffold.starter(root)?
+      Ok("Created " + root)
+    }
+    _ -> Error("unknown command or arguments\n\n" + help())
+  }
+}
+
+help() -> String {
+  "Jinks — a little home for pages\n\nUsage: jinks <command>\n\n  init <directory>   Create a site\n  new <path> [dir]   Create a Markdown draft\n  build [directory]  Write the site\n  check [directory]  Validate without writing\n  clean [directory]  Remove owned generated files\n  serve [directory]  Watch, rebuild, and serve locally\n\nRun a command with --help for its own instructions. Pass --no-color to disable ANSI colours."
+}

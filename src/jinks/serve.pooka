@@ -1,0 +1,112 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// The serve command keeps option parsing out of the watcher. Command-line
+//// overrides sit above config.toml; a misspelled flag never starts a listener.
+module serve
+
+import arglet
+import jinks/provider
+import jinks/watch
+import jinks/request
+import pooka/int
+
+class Options(
+  root: String,
+  host: String,
+  port: Int,
+  live: Bool,
+  selected: request.Request
+)
+
+arguments(values: List(String)) -> Result(arglet.Parsed, String) {
+  match arglet.parse(values, [
+    arglet.flag("help", "h", "Command help"),
+    arglet.value("config", "c", "Configuration file"),
+    arglet.value("output", "o", "Output directory"),
+    arglet.value("base-url", "", "Site URL"),
+    arglet.flag("drafts", "", "Include drafts"),
+    arglet.flag("future", "", "Include future publication days"),
+    arglet.value("host", "", "Loopback address"),
+    arglet.value("port", "p", "Listen port"),
+    arglet.flag("no-reload", "", "Disable browser reload")
+  ]) {
+    Ok(args) -> Ok(args)
+    Error(e) -> Error(arglet.describe(e))
+  }
+}
+
+parse(values: List(String)) -> Result(Options, String) {
+  selection(arguments(values)?)
+}
+
+selection(args: arglet.Parsed) -> Result(Options, String) {
+  let root = match args.positionals {
+    [] -> Ok(".")
+    [root] -> Ok(root)
+    _ -> Error("serve accepts only one site directory")
+  }?
+  let filename = match args.get("config") {
+    Some(value) -> value
+    None -> "config.toml"
+  }
+  let selected = request.select(
+    root,
+    filename,
+    args.get("output"),
+    args.get("base-url"),
+    args.has("drafts"),
+    args.has("future")
+  )?
+  let selected = request.with_environment(selected, "development")?
+  let settings = request.load(selected)?
+  let host = match args.get("host") {
+    None -> Ok(settings.server.host)
+    Some("localhost") -> Ok("127.0.0.1")
+    Some("127.0.0.1") -> Ok("127.0.0.1")
+    Some("::1") -> Ok("::1")
+    Some(_) -> Error("--host must be loopback: localhost, 127.0.0.1, or ::1")
+  }?
+  let port = match args.get("port") {
+    None -> Ok(settings.server.port)
+    Some(value) -> match int.parse(value) {
+      Ok(port) if port >= 0 && port <= 65535 -> Ok(port)
+      _ -> Error("--port must be an integer between 0 and 65535")
+    }
+  }?
+  Ok(
+    Options(
+      selected.root,
+      host,
+      port,
+      settings.server.live_reload && !args.has("no-reload"),
+      selected
+    )
+  )
+}
+
+run(values: List(String)) -> Result(String, String) {
+  run_with(values, [])
+}
+
+run_with(values: List(String), providers: List(provider.Provider)) -> Result(
+  String,
+  String
+) {
+  let args = arguments(values)?
+  match args.has("help") {
+    True -> Ok(help())
+    False -> {
+      let options = selection(args)?
+      watch.run_selected(
+        request.with_providers(options.selected, providers),
+        options.host,
+        options.port,
+        options.live
+      )
+    }
+  }
+}
+
+help() -> String {
+  "Usage: jinks serve [directory] [options]\n\n  --config, -c <file> Configuration file\n  --output, -o <dir>  Override output directory\n  --base-url <url>    Override site URL\n  --drafts           Include draft pages\n  --future           Include future publication days\n  --host <address>  Loopback address (default: 127.0.0.1)\n  --port, -p <n>    Listen port (default: 4000; 0 selects a free port)\n  --no-reload      Rebuild without browser reload\n\nSite defaults come from the selected configuration. Ctrl-C stops the server."
+}

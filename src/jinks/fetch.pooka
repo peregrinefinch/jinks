@@ -1,0 +1,35 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// A provider can ask for JSON without accepting an unbounded response or
+//// weakening certificate checks. This capability is never installed in Tuck.
+module fetch
+
+import pooka/json as json_data
+import pooka/uri
+
+external _Http from erlang "jinks_fetch" {
+  get(url: String, timeout: Int, max_bytes: Int) -> Result(String, String)
+}
+
+json(url: String, timeout: Int, max_bytes: Int) -> Result(
+  json_data.Json,
+  String
+) {
+  let address = match uri.parse(url) {
+    Ok(address) -> Ok(address)
+    Error(_) -> Error("provider URL is invalid")
+  }?
+  let _ = match timeout > 0 && max_bytes > 0 && address.userinfo == None && address.host != None && (
+    address.scheme == Some("http") || address.scheme == Some("https")
+  ) {
+    True -> Ok(Nil)
+    False -> Error(
+      "provider fetch needs an HTTP(S) URL without credentials, a positive timeout and a positive byte limit"
+    )
+  }?
+  let body = _Http.get(url, timeout, max_bytes)?
+  match json_data.decode_with_limits(body, max_bytes, 64) {
+    Ok(value) -> Ok(value)
+    Error(_) -> Error("provider response is not valid bounded JSON")
+  }
+}

@@ -1,0 +1,46 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// Providers are ordinary, explicitly registered Pooka functions. A theme
+//// cannot ask the build to import a module, execute a command or call a URL.
+//// The clock is shared with rendering, and tests can replace every provider.
+module provider
+
+import jinks/config
+import pooka/json
+import pooka/list
+import pooka/string
+
+class Context(root: String, timestamp: String)
+
+class Provider(name: String, load: fn(Context) -> Result(json.Json, String))
+
+run(providers: List(Provider), context: Context, local: json.Json) -> Result(
+  json.Json,
+  String
+) {
+  list.try_fold(providers, local, fn(data, provider) {
+    let _ = config.relative(provider.name)?
+    let _ = match string.contains(provider.name, "/") || string.contains(
+      provider.name,
+      "."
+    ) || json.get(
+      data,
+      provider.name
+    ) != None {
+      True -> Error(
+        "provider name collides with local data or another provider: " + provider.name
+      )
+      False -> Ok(Nil)
+    }?
+    let value = match provider.load(context) {
+      Ok(value) -> Ok(value)
+      Error(error) -> Error("provider " + provider.name + ": " + error)
+    }?
+    match data {
+      json.JObject(fields) -> Ok(
+        json.JObject(list.append(fields, #(provider.name, value)))
+      )
+      _ -> Error("provider context must be a data object")
+    }
+  })
+}

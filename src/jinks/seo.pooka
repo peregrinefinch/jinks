@@ -1,0 +1,69 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// Give themes the facts for a page's head without forcing one head layout.
+//// Canonical URLs use the same deployment root as feeds. JSON-LD remains a
+//// value until the template deliberately encodes it for a script element.
+module seo
+
+import jinks/config
+import jinks/publishing
+import pooka/json
+import pooka/list
+
+text(value: json.Json, key: String, fallback: String) -> String {
+  match json.get(value, key) {
+    Some(json.JString(value)) -> value
+    _ -> fallback
+  }
+}
+
+context(site: config.Config, page: json.Json) -> json.Json {
+  let url = text(page, "url", "/")
+  let title = text(page, "title", site.title)
+  let description = text(
+    page,
+    "description",
+    text(page, "summary", text(site.params, "description", ""))
+  )
+  let canonical = publishing.absolute(site.base_url, url)
+  let authored = match json.get(page, "source") {
+    Some(json.JString(_)) -> True
+    _ -> False
+  }
+  let article = authored && text(page, "collection", "") == site.publishing.collection
+  let kind = match article {
+    True -> "Article"
+    False -> "WebPage"
+  }
+  let dates = match json.get(page, "date") {
+    Some(json.JString(day)) if article -> [
+      #("datePublished", json.JString(day + "T00:00:00Z"))
+    ]
+    _ -> []
+  }
+  json.JObject([
+    #("title", json.JString(title)),
+    #("description", json.JString(description)),
+    #("canonical", json.JString(canonical)),
+    #("article", json.JBool(article)),
+    #("structured_data", json.JObject(list.concat(
+      [
+        #("@context", json.JString("https://schema.org")),
+        #("@type", json.JString(kind)),
+        #("headline", json.JString(title)),
+        #("description", json.JString(description)),
+        #("url", json.JString(canonical)),
+        #(
+          "author",
+          json.JObject(
+            [
+              #("@type", json.JString("Person")),
+              #("name", json.JString(text(site.params, "author", site.title)))
+            ]
+          )
+        )
+      ],
+      dates
+    )))
+  ])
+}

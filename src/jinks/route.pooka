@@ -1,0 +1,117 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// Give each page an address before any files are written. Keeping this
+//// calculation pure makes collisions something we can catch at the door.
+module route
+
+import jinks/config
+import jinks/names
+import pooka/list
+import pooka/path
+import pooka/string
+import pooka/uri
+
+/// `notes/owl.md` becomes `notes/owl/index.html`; an index keeps its seat.
+output(relative: String) -> Result(String, String) {
+  let relative = names.canonical(relative)
+  let _ = checked(relative)?
+  let parts = string.split(relative, ".")
+  let _ = match string.ends_with(string.lowercase(relative), ".md") {
+    True -> Ok(Nil)
+    False -> Error("expected a Markdown page: " + relative)
+  }?
+  let stem = string.join(list.take(parts, list.length(parts) - 1), ".")
+  match stem {
+    "index" -> Ok("index.html")
+    _ -> match string.ends_with(stem, "/index") {
+      True -> Ok(stem + ".html")
+      False -> Ok(stem + "/index.html")
+    }
+  }
+}
+
+url(output: String) -> String {
+  let output = names.canonical(output)
+  let readable = match output {
+    "index.html" -> ""
+    _ -> match string.ends_with(output, "/index.html") {
+      True -> string.drop_end(output, 10)
+      False -> output
+    }
+  }
+  "/" + string.join(
+    list.map(string.split(readable, "/"), uri.percent_encode),
+    "/"
+  )
+}
+
+/// Explicit permalinks name URLs, not arbitrary filesystem paths. Decode once
+/// for the output filename, then encode each segment when exposing its URL.
+permalink(value: String) -> Result(String, String) {
+  let _ = match string.starts_with(value, "/") && !string.starts_with(
+    value,
+    "//"
+  ) && !string.contains(value, "?") && !string.contains(value, "#") {
+    True -> Ok(Nil)
+    False -> Error(
+      "permalink must be a site-relative URL without query or fragment"
+    )
+  }?
+  let decoded = match uri.percent_decode(value) {
+    Ok(v) -> Ok(v)
+    Error(_) -> Error("invalid permalink encoding")
+  }?
+  let decoded = names.canonical(decoded)
+  let relative = string.remove_suffix(string.remove_prefix(decoded, "/"), "/")
+  match relative {
+    "" -> Ok("index.html")
+    _ -> {
+      let _ = checked(relative)?
+      match !string.ends_with(decoded, "/") && list.any(
+        [
+          ".html",
+          ".xml",
+          ".svg",
+          ".json",
+          ".txt",
+          ".css",
+          ".js",
+          ".webmanifest"
+        ],
+        fn(extension) { string.ends_with(string.lowercase(relative), extension) }
+      ) {
+        True -> Ok(relative)
+        False -> Ok(relative + "/index.html")
+      }
+    }
+  }
+}
+
+checked(relative: String) -> Result(String, String) {
+  let _ = config.relative(relative)?
+  match list.any(string.split(relative, "/"), fn(part) {
+    string.starts_with(part, ".") || !names.portable(part) || string.lowercase(
+      part
+    ) == "__jinks"
+  }) {
+    True -> Error(
+      "hidden, reserved, or non-portable output path: " + relative
+    )
+    False -> Ok(relative)
+  }
+}
+
+/// A standalone page can name its output format: index.html.tuck and
+/// feed.xml.tuck retain that extension; about.tuck uses a clean HTML URL.
+template_output(source: String) -> Result(String, String) {
+  let _ = checked(source)?
+  let _ = match string.ends_with(string.lowercase(source), ".tuck") {
+    True -> Ok(Nil)
+    False -> Error("expected a Tuck page: " + source)
+  }?
+  let name = names.canonical(string.drop_end(source, 5))
+  match path.extension(name) {
+    Some(_) -> checked(name)
+    None -> output(name + ".md")
+  }
+}

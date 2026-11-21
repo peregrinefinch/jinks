@@ -1,0 +1,193 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// A listing is an explicit invitation to create more pages. Keeping these
+//// options separate from collection membership lets an ordinary collection
+//// stay just a list until its author chooses an archive address and layout.
+module listing_options
+
+import jinks/names
+import pooka/list
+import pooka/uri
+import pooka/string
+import tome
+
+class Archive(
+  collection: String,
+  url: String,
+  layout: String,
+  title: String,
+  size: Int,
+  page_path: String
+)
+
+class Tags(
+  enabled: Bool,
+  path: String,
+  layout: String,
+  index: Option(String),
+  index_layout: String,
+  index_title: String,
+  size: Int,
+  collection: String,
+  page_path: String
+)
+
+class Options(archives: List(Archive), tags: Tags)
+
+parse(doc: tome.Toml) -> Result(Options, String) {
+  let entries = match tome.get(doc, "collections") {
+    Some(tome.TTable(entries)) -> entries
+    None -> []
+    _ -> []
+  }
+  let archives = list.try_fold(entries, [], fn(found, entry) {
+    let settings = entry.1
+    let size = positive(settings, "page-size", 30)?
+    let prefix = text(settings, "page-path", "page")?
+    let _ = relative(prefix)?
+    let layout = layout(text(settings, "archive-layout", "list.html.tuck")?)?
+    let title = text(settings, "archive-title", entry.0)?
+    match optional_url(settings, "archive")? {
+      None -> Ok(found)
+      Some(url) -> Ok(
+        list.append(found, Archive(entry.0, url, layout, title, size, prefix))
+      )
+    }
+  })?
+  let tags = tags(doc)?
+  let _ = match tags.collection == "" || list.any(entries, fn(entry) {
+    entry.0 == tags.collection
+  }) {
+    True -> Ok(Nil)
+    False -> Error("tags.collection does not name a configured collection")
+  }?
+  Ok(Options(archives, tags))
+}
+
+tags(doc: tome.Toml) -> Result(Tags, String) {
+  let table = match tome.get(doc, "tags") {
+    None -> Ok(tome.TTable([#("enabled", tome.TBool(False))]))
+    Some(tome.TTable(entries)) -> {
+      let _ = list.try_fold(entries, Nil, fn(_, entry) {
+        match list.contains(
+          [
+            "enabled",
+            "path",
+            "layout",
+            "index",
+            "index-layout",
+            "index-title",
+            "page-size",
+            "collection",
+            "page-path"
+          ],
+          entry.0
+        ) {
+          True -> Ok(Nil)
+          False -> Error("unsupported tags setting: " + entry.0)
+        }
+      })?
+      Ok(tome.TTable(entries))
+    }
+    _ -> Error("tags must be a table")
+  }?
+  let enabled = match tome.get(table, "enabled") {
+    None -> Ok(True)
+    Some(tome.TBool(v)) -> Ok(v)
+    _ -> Error("tags.enabled must be a Boolean")
+  }?
+  let folder = text(table, "path", "tag")?
+  let _ = relative(folder)?
+  let page_path = text(table, "page-path", "page")?
+  let _ = relative(page_path)?
+  let chosen = layout(text(table, "layout", "tag.html.tuck")?)?
+  let index = optional_url(table, "index")?
+  let index_layout = layout(text(table, "index-layout", "tags.html.tuck")?)?
+  let index_title = text(table, "index-title", "Tags")?
+  let size = positive(table, "page-size", 30)?
+  let collection = text(table, "collection", "")?
+  Ok(
+    Tags(
+      enabled,
+      folder,
+      chosen,
+      index,
+      index_layout,
+      index_title,
+      size,
+      collection,
+      page_path
+    )
+  )
+}
+
+text(doc: tome.Toml, key: String, fallback: String) -> Result(String, String) {
+  match tome.get(doc, key) {
+    None -> Ok(fallback)
+    Some(tome.TString(v)) -> Ok(v)
+    _ -> Error(key + " must be a string")
+  }
+}
+
+positive(doc: tome.Toml, key: String, fallback: Int) -> Result(Int, String) {
+  match tome.get(doc, key) {
+    None -> Ok(fallback)
+    Some(tome.TInt(v)) if v > 0 -> Ok(v)
+    _ -> Error(key + " must be a positive integer")
+  }
+}
+
+optional_url(doc: tome.Toml, key: String) -> Result(Option(String), String) {
+  match tome.get(doc, key) {
+    None -> Ok(None)
+    Some(tome.TString(url)) -> {
+      let _ = match string.starts_with(url, "/") && !string.starts_with(
+        url,
+        "//"
+      ) && string.ends_with(url, "/") && !string.contains(url, "?") && !string.contains(
+        url,
+        "#"
+      ) {
+        True -> Ok(Nil)
+        False -> Error(
+          key + " must be a directory URL beginning and ending with /"
+        )
+      }?
+      let decoded = match uri.percent_decode(url) {
+        Ok(decoded) -> Ok(decoded)
+        Error(_) -> Error(key + " contains invalid URL encoding")
+      }?
+      let path = string.remove_suffix(string.remove_prefix(decoded, "/"), "/")
+      let _ = match path {
+        "" -> Ok("")
+        _ -> relative(path)
+      }?
+      Ok(Some(url))
+    }
+    _ -> Error(key + " must be a URL string")
+  }
+}
+
+relative(value: String) -> Result(String, String) {
+  match !string.is_empty(value) && !string.starts_with(value, "/") && list.all(
+    string.split(value, "/"),
+    fn(part) {
+      names.portable(part) && !string.starts_with(part, ".") && string.lowercase(
+        part
+      ) != "__jinks"
+    }
+  ) {
+    True -> Ok(value)
+    False -> Error(
+      "listing path must be a portable relative directory: " + value
+    )
+  }
+}
+
+layout(name: String) -> Result(String, String) {
+  let _ = relative(name)?
+  match string.ends_with(string.lowercase(name), ".tuck") {
+    True -> Ok(name)
+    False -> Ok(name + ".html.tuck")
+  }
+}

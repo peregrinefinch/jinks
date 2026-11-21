@@ -1,0 +1,72 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// A data file gets a name from its place on the shelf. TOML and JSON share
+//// the same template boundary, but two files cannot quietly claim one name.
+//// Nested directories become nested objects: data/people/finch.toml is
+//// available as data.people.finch, without any code running in the template.
+module data
+
+import jinks/boundary
+import jinks/publish
+import jinks/storage
+import jinks/value
+import pooka/file
+import pooka/json
+import pooka/list
+import pooka/path
+import pooka/string
+import tome
+import pooka/int
+
+load(root: String) -> Result(json.Json, String) {
+  let _ = boundary.guard(root, "data")?
+  let folder = path.join([root, "data"])
+  let names = match file.is_directory(folder) {
+    Ok(False) -> match file.exists(folder) {
+      Ok(False) -> Ok([])
+      Ok(True) -> Error("data must be a directory")
+      Error(e) -> Error(e.message)
+    }
+    Ok(True) -> storage.files(folder, "")
+    Error(e) -> Error(e.message)
+  }?
+  let inputs = list.filter(names, fn(name) {
+    let lower = string.lowercase(name)
+    string.ends_with(lower, ".toml") || string.ends_with(lower, ".json")
+  })
+  let keys = list.map(inputs, fn(name) { string.drop_end(name, 5) })
+  let _ = list.try_fold(keys, [], fn(found, key) {
+    match list.any(found, fn(previous) { publish.conflicts(previous, key) }) {
+      True -> Error("data names collide: " + key)
+      False -> Ok(list.append(found, key))
+    }
+  })?
+  let empty: json.Json = json.JObject([])
+  list.try_fold(inputs, empty, fn(found, name) {
+    let source = storage.read(path.join([folder, name]))?
+    let parsed = match string.ends_with(string.lowercase(name), ".toml") {
+      True -> match tome.parse(source) {
+        Ok(doc) -> value.to_json(doc)
+        Error(e) -> Error(name + ":" + int.to_string(e.line) + ": " + e.message)
+      }
+      False -> match json.decode(source) {
+        Ok(doc) -> Ok(doc)
+        Error(_) -> Error(name + ": invalid JSON data")
+      }
+    }?
+    Ok(insert(found, string.split(string.drop_end(name, 5), "/"), parsed))
+  })
+}
+
+insert(root: json.Json, names: List(String), entry: json.Json) -> json.Json {
+  match names {
+    [] -> entry
+    [name, ..rest] -> {
+      let child = match json.get(root, name) {
+        Some(child) -> child
+        None -> json.JObject([])
+      }
+      value.merge(root, json.JObject([#(name, insert(child, rest, entry))]))
+    }
+  }
+}

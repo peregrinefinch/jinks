@@ -1,0 +1,187 @@
+// SPDX-License-Identifier: Apache-2.0
+module site_data_test
+
+import jinks/build
+import jinks/data
+import jinks/scaffold
+import jinks/storage
+import poke/should
+import poke/snapshot
+import pooka/file
+import pooka/int
+import pooka/json
+import pooka/list
+import pooka/path
+import pooka/process
+import pooka/string
+
+site(name: String) -> String {
+  let root = "build/jinks-data/" + int.to_string(process.pid()) + "/" + name
+  let _ = should.be_ok(scaffold.create(root))
+  root
+}
+
+write(root: String, name: String, text: String) {
+  let _ = should.be_ok(storage.write(path.join([root, name]), text))
+  Nil
+}
+
+test "local TOML and nested JSON data retain native template types" {
+  let root = site("load")
+  write(root, "data/menu.toml", "title = \"Workshop\"\ncount = 3")
+  write(root, "data/people/finch.json", "{\"name\":\"Finch\",\"active\":true}")
+  let loaded = should.be_ok(data.load(root))
+  should.equal(json.path(loaded, ["menu", "count"]), Some(json.JInt(3)))
+  should.equal(
+    json.path(loaded, ["people", "finch", "active"]),
+    Some(json.JBool(True))
+  )
+}
+
+test "ambiguous data names and malformed data stop a build before publication" {
+  let root = site("collision")
+  write(root, "data/team.toml", "name = \"Owl\"")
+  write(root, "data/team.json", "{}")
+  let _ = should.be_error(build.run(root))
+  should.be_false(should.be_ok(file.exists(path.join([root, "public"]))))
+  let _ = should.be_ok(file.delete(path.join([root, "data/team.json"])))
+  write(root, "data/invalid.json", "{")
+  let error = should.be_error(build.run(root))
+  should.be_true(string.contains(error, "invalid.json"))
+}
+
+test "data file and directory namespaces cannot silently merge" {
+  let root = site("prefix")
+  write(root, "data/team.toml", "name = \"Owl\"")
+  write(root, "data/team/finch.json", "{}")
+  let _ = should.be_error(data.load(root))
+}
+
+test "theme defaults, site overrides and local data render together" {
+  let root = site("parameters")
+  write(
+    root,
+    "themes/minimal/theme.toml",
+    "name = \"minimal\"\n[params.palette]\npaper = \"cream\"\nink = \"brown\""
+  )
+  write(root, "config.toml", "[params.palette]\nink = \"purple\"")
+  write(root, "data/menu.toml", "title = \"<Workshop>\"")
+  write(
+    root,
+    "layouts/page.html.tuck",
+    "{{ site.params.palette.paper }} {{ site.params.palette.ink }} {{ data.menu.title }}"
+  )
+  let _ = should.be_ok(build.run(root))
+  should.equal(
+    should.be_ok(storage.read(path.join([root, "public/index.html"]))),
+    "cream purple &lt;Workshop&gt;"
+  )
+}
+
+test "collections feed index templates and page neighbours using one ordered set" {
+  let root = site("collections")
+  write(
+    root,
+    "config.toml",
+    "[collections.posts]\npath = \"posts\"\nsort = \"date\"\ndirection = \"descending\"\npermalink = \"/:year/:slug/\"\n[collections.posts.defaults]\nlayout = \"post\""
+  )
+  write(
+    root,
+    "content/posts/first.md",
+    "---\ntitle = \"First\"\ndate = 2020-01-02\n---\nHello"
+  )
+  write(
+    root,
+    "content/posts/old.md",
+    "---\ntitle = \"Old\"\ndate = 2019-01-01\n---\nHello"
+  )
+  write(
+    root,
+    "layouts/page.html.tuck",
+    "{% for post in collections.posts %}{{ post.title }}:{{ post.url }};{% endfor %}"
+  )
+  write(
+    root,
+    "layouts/post.html.tuck",
+    "{{ page.title }}|{% if page.previous %}{{ page.previous.title }}{% endif %}|{% if page.next %}{{ page.next.title }}{% endif %}"
+  )
+  should.equal(should.be_ok(build.run(root)), 3)
+  should.equal(
+    should.be_ok(storage.read(path.join([root, "public/index.html"]))),
+    "First:/2020/first/;Old:/2019/old/;"
+  )
+  should.equal(
+    should.be_ok(
+      storage.read(path.join([root, "public/2020/first/index.html"]))
+    ),
+    "First||Old"
+  )
+  should.equal(
+    should.be_ok(storage.read(path.join([root, "public/2019/old/index.html"]))),
+    "Old|First|"
+  )
+}
+
+test "future and draft pages are excluded from both output and collection data" {
+  let root = site("visibility")
+  write(root, "config.toml", "[collections.posts]\npath = \"posts\"")
+  write(root, "content/posts/future.md", "---\ndate = 2030-01-01\n---\nFuture")
+  write(root, "content/posts/draft.md", "---\ndraft = true\n---\nDraft")
+  write(
+    root,
+    "layouts/page.html.tuck",
+    "{% for post in collections.posts %}{{ post.source }}{% endfor %}"
+  )
+  let #(_, outputs) = should.be_ok(build.prepare_at(root, "2020-01-01"))
+  should.equal(list.length(outputs), 1)
+  should.equal(should.be_some(list.first(outputs)).text, "")
+  write(
+    root,
+    "config.toml",
+    "[build]\ndrafts = true\nfuture = true\n[collections.posts]\npath = \"posts\""
+  )
+  let #(_, all) = should.be_ok(build.prepare_at(root, "2020-01-01"))
+  should.equal(list.length(all), 3)
+}
+
+test "data is protected as source even through direct configured output" {
+  let root = site("protected-data")
+  write(root, "config.toml", "output-dir = \"data\"")
+  let _ = should.be_error(build.run(root))
+}
+
+test "a data file cannot masquerade as the optional data directory" {
+  let root = site("not-a-directory")
+  write(root, "data", "not a directory")
+  let _ = should.be_error(data.load(root))
+}
+
+test "a collection index keeps a complete HTML snapshot" {
+  let root = site("snapshot")
+  write(
+    root,
+    "config.toml",
+    "title = \"Workshop\"\n[collections.posts]\nsort = \"date\"\ndirection = \"descending\"\npermalink = \"/:year/:slug/\"\n[collections.posts.defaults]\nlayout = \"post\""
+  )
+  write(
+    root,
+    "content/posts/owl.md",
+    "---\ntitle = \"<Owl & Finch>\"\ndate = 2020-01-02\n---\nHello"
+  )
+  write(
+    root,
+    "content/posts/old.md",
+    "---\ntitle = \"Old notes\"\ndate = 2019-01-01\n---\nHello"
+  )
+  write(
+    root,
+    "layouts/page.html.tuck",
+    "<!doctype html>\n<title>{{ site.title }}</title>\n<ul>\n{% for post in collections.posts %}<li><a href=\"{{ post.url }}\">{{ post.title }}</a></li>\n{% endfor %}</ul>\n"
+  )
+  write(root, "layouts/post.html.tuck", "{{ content | safe }}")
+  let #(_, outputs) = should.be_ok(build.prepare_at(root, "2020-01-03"))
+  let home = should.be_some(list.find(outputs, fn(page: build.Output) {
+    page.name == "index.html"
+  }))
+  snapshot.snap(home.text, "collection-home")
+}

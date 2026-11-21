@@ -1,0 +1,140 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// Collection rules describe a shelf before any books arrive. They are kept
+//// apart from rendering so configuration never depends on a parsed page.
+module section
+
+import tome
+import pooka/list
+import pooka/string
+
+class Spec(
+  name: String,
+  path: String,
+  sort: String,
+  descending: Bool,
+  permalink: String,
+  defaults: tome.Toml
+)
+
+parse(doc: tome.Toml) -> Result(List(Spec), String) {
+  let entries = match tome.get(doc, "collections") {
+    None -> Ok([])
+    Some(tome.TTable(entries)) -> Ok(entries)
+    _ -> Error("collections must be a table")
+  }?
+  let specs = list.try_map(entries, fn(entry) { read(entry.0, entry.1) })?
+  let _ = list.try_fold(specs, [], fn(found, spec) {
+    match list.any(found, fn(previous: Spec) {
+      string.lowercase(previous.path) == string.lowercase(spec.path)
+    }) {
+      True -> Error("collections share an input path: " + spec.path)
+      False -> Ok(list.append(found, spec))
+    }
+  })?
+  Ok(specs)
+}
+
+read(name: String, doc: tome.Toml) -> Result(Spec, String) {
+  let _ = match name == "" || string.lowercase(name) == "all" {
+    True -> Error("collection name must be nonempty and must not be all")
+    False -> Ok(Nil)
+  }?
+  let entries = match doc {
+    tome.TTable(entries) -> Ok(entries)
+    _ -> Error("collection " + name + " must be a table")
+  }?
+  let _ = list.try_fold(entries, Nil, fn(_, entry) {
+    match list.contains(
+      [
+        "path",
+        "sort",
+        "direction",
+        "permalink",
+        "defaults",
+        "archive",
+        "archive-layout",
+        "archive-title",
+        "page-size",
+        "page-path"
+      ],
+      entry.0
+    ) {
+      True -> Ok(Nil)
+      False -> Error("unsupported collection setting: " + name + "." + entry.0)
+    }
+  })?
+  let folder = text(doc, "path", name)?
+  let _ = match folder == "" || valid_path(folder) {
+    True -> Ok(Nil)
+    False -> Error(
+      "collection path must be a relative content directory: " + folder
+    )
+  }?
+  let sort = text(doc, "sort", "path")?
+  let _ = match list.contains(["path", "title", "date", "order"], sort) {
+    True -> Ok(Nil)
+    False -> Error("collection sort must be path, title, date, or order")
+  }?
+  let direction = text(doc, "direction", "ascending")?
+  let descending = match direction {
+    "ascending" -> Ok(False)
+    "descending" -> Ok(True)
+    _ -> Error("collection direction must be ascending or descending")
+  }?
+  let pattern = text(doc, "permalink", "")?
+  let substituted = list.fold(
+    [":year", ":month", ":day", ":slug", ":section"],
+    pattern,
+    fn(text, token) { string.replace(text, token, "part") }
+  )
+  let _ = match pattern == "" || (
+    string.starts_with(pattern, "/") && !string.starts_with(pattern, "//") && !string.contains(
+      substituted,
+      ":"
+    ) && !string.contains(pattern, "?") && !string.contains(pattern, "#")
+  ) {
+    True -> Ok(Nil)
+    False -> Error(
+      "collection permalink must be site-relative and use only year, month, day, slug, or section placeholders"
+    )
+  }?
+  let defaults = match tome.get(doc, "defaults") {
+    None -> Ok(tome.TTable([]))
+    Some(tome.TTable(entries)) -> Ok(tome.TTable(entries))
+    _ -> Error("collection defaults must be a table")
+  }?
+  Ok(Spec(name, folder, sort, descending, pattern, defaults))
+}
+
+valid_path(value: String) -> Bool {
+  !string.starts_with(value, "/") && !string.contains(value, "\\") && !string.contains(
+    value,
+    ":"
+  ) && !list.any(string.split(value, "/"), fn(part) {
+    part == "" || string.starts_with(part, ".")
+  })
+}
+
+text(doc: tome.Toml, key: String, fallback: String) -> Result(String, String) {
+  match tome.get(doc, key) {
+    None -> Ok(fallback)
+    Some(tome.TString(v)) -> Ok(v)
+    _ -> Error("collection " + key + " must be a string")
+  }
+}
+
+/// The nearest matching directory wins; guides/advanced can specialise guides.
+find(specs: List(Spec), name: String) -> Option(Spec) {
+  list.fold(specs, None, fn(found: Option(Spec), spec: Spec) {
+    match spec.path == "" || string.starts_with(name, spec.path + "/") {
+      False -> found
+      True -> match found {
+        Some(previous) if string.length(previous.path) >= string.length(
+          spec.path
+        ) -> found
+        _ -> Some(spec)
+      }
+    }
+  })
+}

@@ -1,0 +1,92 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// A little orange for completed work, and a short, honest duration. Help
+//// stays plain text; redirected output receives no terminal escapes unless
+//// the caller explicitly asks with FORCE_COLOR.
+module log
+
+import pooka/env
+import pooka/int
+import pooka/list
+import pooka/string
+
+external _Console from erlang "jinks_console" {
+  terminal() -> Bool
+}
+
+arguments(args: List(String)) -> List(String) {
+  match args {
+    [] -> []
+    ["--", ..rest] -> ["--", ..rest]
+    ["--no-color", ..rest] -> arguments(rest)
+    [option, value, ..rest] if list.contains(
+      [
+        "--title",
+        "--date",
+        "--layout",
+        "--config",
+        "-c",
+        "--output",
+        "-o",
+        "--base-url",
+        "--environment",
+        "--host",
+        "--port",
+        "-p"
+      ],
+      option
+    ) -> [option, value, ..arguments(rest)]
+    [arg, ..rest] -> [arg, ..arguments(rest)]
+  }
+}
+
+colours(args: List(String)) -> Bool {
+  match list.contains(args, "--no-color") || env.get("NO_COLOR") != Ok(None) {
+    True -> False
+    False -> match env.get("FORCE_COLOR") {
+      Ok(Some("0")) -> False
+      Ok(Some(_)) -> True
+      _ -> _Console.terminal()
+    }
+  }
+}
+
+duration(milliseconds: Int) -> String {
+  match milliseconds < 1000 {
+    True -> int.to_string(milliseconds) + "ms"
+    False -> {
+      let digits = int.to_string(milliseconds)
+      let whole = string.drop_end(digits, 3)
+      let fraction = trim_zeroes(
+        string.drop_start(digits, string.length(digits) - 3)
+      )
+      whole + match fraction {
+        "" -> "s"
+        _ -> "." + fraction + "s"
+      }
+    }
+  }
+}
+
+success(message: String, milliseconds: Int, colour: Bool) -> String {
+  match string.split_once(message, " ") {
+    Some(#(label, rest)) if list.contains(
+      ["Built", "Checked", "Created", "Cleaned"],
+      label
+    ) -> {
+      let label = match colour {
+        True -> "\u{1b}[38;2;255;137;31m" + label + "\u{1b}[0m"
+        False -> label
+      }
+      "  " + label + " " + rest + " in " + duration(milliseconds)
+    }
+    _ -> message
+  }
+}
+
+trim_zeroes(text: String) -> String {
+  match string.ends_with(text, "0") {
+    True -> trim_zeroes(string.drop_end(text, 1))
+    False -> text
+  }
+}

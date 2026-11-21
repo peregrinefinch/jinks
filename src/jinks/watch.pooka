@@ -1,0 +1,237 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// A portable watcher that asks whether the words changed, not merely their
+//// timestamp. Two matching observations debounce a save. Publication stays
+//// serial; an edit made during a build is noticed on the next observation.
+module watch
+
+import jinks/boundary
+import jinks/build
+import jinks/request
+import jinks/server
+import jinks/storage
+import pooka/file
+import pooka/int
+import pooka/io
+import pooka/list
+import pooka/path
+import pooka/time
+import pooka/string
+
+class State(
+  root: String,
+  server: server.Running,
+  observed: List(#(String, BitArray)),
+  pending: Option(List(#(String, BitArray))),
+  revision: Int,
+  problem: String,
+  selected: request.Request
+)
+
+external _Digest from erlang "jinks_http" {
+  digest(bytes: BitArray) -> BitArray
+}
+
+/// Ignore output, staging, manifests and caches by enumerating only inputs.
+/// Hashing detects same-length edits even when filesystem times are unchanged.
+snapshot(root: String) -> Result(List(#(String, BitArray)), String) {
+  snapshot_selected(request.defaults(root))
+}
+
+snapshot_selected(selected: request.Request) -> Result(
+  List(#(String, BitArray)),
+  String
+) {
+  let root = selected.root
+  let _ = boundary.guard(root, selected.file)?
+  let files = list.try_fold(
+    ["content", "themes", "layouts", "data", "static", "samples"],
+    [selected.file],
+    fn(found, directory) {
+      let _ = boundary.guard(root, directory)?
+      let nested = match file.is_directory(path.join([root, directory])) {
+        Ok(False) -> Ok([])
+        Ok(True) -> storage.files(path.join([root, directory]), "")
+        Error(e) -> Error(e.message)
+      }?
+      Ok(
+        list.concat(
+          found,
+          list.map(nested, fn(name) { directory + "/" + name })
+        )
+      )
+    }
+  )?
+  list.try_map(list.sort(files), fn(name) {
+    let bytes = match file.read_bytes(path.join([root, name])) {
+      Ok(bytes) -> Ok(bytes)
+      Error(e) -> Error(e.path + ": " + e.message)
+    }?
+    Ok(#(name, _Digest.digest(bytes)))
+  })
+}
+
+start(root: String, host: String, port: Int, live: Bool) -> Result(
+  State,
+  String
+) {
+  start_selected(request.defaults(root), host, port, live)
+}
+
+start_selected(selected: request.Request, host: String, port: Int, live: Bool) -> Result(
+  State,
+  String
+) {
+  let before = snapshot_selected(selected)?
+  let #(settings, _) = build.run_selected(selected)?
+  let running = server.start_site(
+    path.join([selected.root, settings.output]),
+    host,
+    port,
+    live,
+    settings.base_url
+  )?
+  Ok(State(selected.root, running, before, None, 0, "", selected))
+}
+
+/// Tick is exposed separately from sleeping so saves, failures and recovery
+/// can be regression-tested without a timing race or an infinite CLI process.
+tick(state: State) -> Result(State, String) {
+  let _ = match server.alive(state.server) {
+    True -> Ok(Nil)
+    False -> Error("development server stopped")
+  }?
+  match snapshot_selected(state.selected) {
+    Error(problem) -> failed(state, [], problem)
+    Ok(current) if current == state.observed -> Ok(
+      State(
+        state.root,
+        state.server,
+        current,
+        None,
+        state.revision,
+        state.problem,
+        state.selected
+      )
+    )
+    Ok(current) -> match state.pending {
+      Some(candidate) if candidate == current -> rebuild(state, current)
+      _ -> Ok(
+        State(
+          state.root,
+          state.server,
+          state.observed,
+          Some(current),
+          state.revision,
+          state.problem,
+          state.selected
+        )
+      )
+    }
+  }
+}
+
+/// Only edits to existing CSS assets can be swapped without reloading HTML.
+/// Added, removed or renamed files may change generated links, so rebuilds
+/// containing those changes retain the conservative full-page reload.
+css_only(before: List(#(String, BitArray)), after: List(#(String, BitArray))) -> Bool {
+  let same_names = list.map(before, fn(entry) { entry.0 }) == list.map(
+    after,
+    fn(entry) { entry.0 }
+  )
+  let changed = list.filter(after, fn(entry) { !list.contains(before, entry) })
+  same_names && !list.is_empty(changed) && list.all(changed, fn(entry) {
+    string.ends_with(string.lowercase(entry.0), ".css") && (
+      string.starts_with(entry.0, "static/") || (
+        string.starts_with(entry.0, "themes/") && string.contains(
+          entry.0,
+          "/static/"
+        )
+      )
+    )
+  })
+}
+
+rebuild(state: State, current: List(#(String, BitArray))) -> Result(
+  State,
+  String
+) {
+  match build.run_selected(state.selected) {
+    Error(problem) -> failed(state, current, problem)
+    Ok(#(settings, _count)) -> {
+      let running = server.retarget_site(
+        state.server,
+        path.join([state.root, settings.output]),
+        settings.base_url
+      )?
+      let revision = state.revision + 1
+      let _ = server.notify_styles(
+        running,
+        revision,
+        "",
+        css_only(state.observed, current)
+      )?
+      Ok(
+        State(state.root, running, current, None, revision, "", state.selected)
+      )
+    }
+  }
+}
+
+failed(state: State, current: List(#(String, BitArray)), problem: String) -> Result(
+  State,
+  String
+) {
+  let _ = server.notify(state.server, state.revision, problem)?
+  Ok(
+    State(
+      state.root,
+      state.server,
+      current,
+      None,
+      state.revision,
+      problem,
+      state.selected
+    )
+  )
+}
+
+run(root: String, host: String, port: Int, live: Bool) -> Result(String, String) {
+  run_selected(request.defaults(root), host, port, live)
+}
+
+run_selected(selected: request.Request, host: String, port: Int, live: Bool) -> Result(
+  String,
+  String
+) {
+  let state = start_selected(selected, host, port, live)?
+  let address = match host {
+    "::1" -> "[::1]"
+    _ -> host
+  }
+  let _ = io.println(
+    "   Serving http://" + address + ":" + int.to_string(state.server.port) + server.mount_url(
+      state.server.mount
+    ) + " (Ctrl-C to stop)"
+  )
+  let result = wait(state)
+  let _ = server.stop(state.server)
+  result
+}
+
+wait(state: State) -> Result(String, String) {
+  let _ = match time.sleep(time.milliseconds(250)) {
+    Ok(_) -> Ok(Nil)
+    Error(_) -> Error("watch timer failed")
+  }?
+  let next = tick(state)?
+  let _ = match next.problem != state.problem && next.problem != "" {
+    True -> io.eprintln("error: " + next.problem)
+    False -> Ok(Nil)
+  }
+  let _ = match next.revision != state.revision {
+    True -> io.println("   Rebuilt site")
+    False -> Ok(Nil)
+  }
+  wait(next)
+}

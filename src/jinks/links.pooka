@@ -1,0 +1,294 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// Check local destinations in rendered pages, so includes and generated
+//// navigation get the same scrutiny as Markdown links. This is a bounded
+//// attribute scanner, not a browser DOM: scripts, styles and comments are
+//// skipped, and external URLs are never contacted.
+module links
+
+import jinks/route
+import pooka/dict
+import pooka/list
+import pooka/string
+import pooka/uri
+
+check(base: String, outputs: List(#(String, String)), assets: List(String)) -> Result(
+  Nil,
+  String
+) {
+  let documents = list.filter(outputs, fn(page) {
+    string.ends_with(page.0, ".html")
+  })
+  let known = dict.from_list(list.map(
+    list.concat(
+      list.map(outputs, fn(page) {
+        page.0
+      }),
+      assets
+    ),
+    fn(name) { #(name, True) }
+  ))
+  let attributes = dict.from_list(list.map(documents, fn(page) {
+    #(page.0, scan(string.split(page.1, ""), []))
+  }))
+  let prefix = match uri.parse(base) {
+    Ok(address) -> string.remove_suffix(address.path, "/")
+    Error(_) -> ""
+  }
+  list.try_fold(documents, Nil, fn(_, page) {
+    let fields = attributes.get_or(page.0, [])
+    list.try_fold(fields, Nil, fn(_, field) {
+      match list.contains(["href", "src", "action"], field.0) {
+        False -> Ok(Nil)
+        True -> match destination(prefix, page.0, field.1, known, attributes) {
+          Ok(_) -> Ok(Nil)
+          Error(error) -> Error(
+            page.0 + ": broken local link `" + field.1 + "`: " + error
+          )
+        }
+      }
+    })
+  })
+}
+
+destination(
+  prefix: String,
+  source: String,
+  value: String,
+  known: dict.Dict(String, Bool),
+  documents: dict.Dict(String, List(#(String, String)))
+) -> Result(Nil, String) {
+  let value = string.trim(value)
+  let target = match uri.parse(iri(value)) {
+    Ok(target) -> Ok(target)
+    Error(_) -> Error("invalid URL")
+  }?
+  match target.scheme != None || target.host != None || value == "" {
+    True -> Ok(Nil)
+    False -> {
+      let decoded = match uri.percent_decode(target.path) {
+        Ok(path) -> Ok(path)
+        Error(_) -> Error("invalid URL encoding")
+      }?
+      let chosen = match decoded {
+        "" -> Ok(route.url(source))
+        _ if string.starts_with(decoded, "/") -> match prefix {
+          "" -> Ok(decoded)
+          _ if string.starts_with(decoded, prefix + "/") -> Ok(
+            string.drop_start(decoded, string.length(prefix))
+          )
+          _ -> Error("path is outside the base-url deployment prefix")
+        }
+        _ -> {
+          let source_url = route.url(source)
+          let parts = string.split(source_url, "/")
+          let directory = match string.ends_with(source_url, "/") {
+            True -> source_url
+            False -> string.join(list.take(parts, list.length(parts) - 1), "/") + "/"
+          }
+          Ok(directory + decoded)
+        }
+      }?
+      let parts = normalize(string.split(chosen, "/"), [])?
+      let filename = string.join(parts, "/")
+      let selected = match known.has_key(filename) {
+        True -> Ok(filename)
+        False -> {
+          let index = match filename {
+            "" -> "index.html"
+            _ -> filename + "/index.html"
+          }
+          match known.has_key(index) {
+            True -> Ok(index)
+            False -> Error("target does not exist")
+          }
+        }
+      }?
+      match target.fragment {
+        Some(fragment) if fragment != "" -> {
+          let fragment = match uri.percent_decode(fragment) {
+            Ok(fragment) -> Ok(fragment)
+            Error(_) -> Error("invalid fragment encoding")
+          }?
+          match documents.get(selected) {
+            Some(fields) -> match list.contains(fields, #("id", fragment)) || list.contains(
+              fields,
+              #("name", fragment)
+            ) {
+              True -> Ok(Nil)
+              False -> Error("target has no anchor #" + fragment)
+            }
+            None -> Ok(Nil)
+          }
+        }
+        _ -> Ok(Nil)
+      }
+    }
+  }
+}
+
+normalize(parts: List(String), reversed: List(String)) -> Result(
+  List(String),
+  String
+) {
+  match parts {
+    [] -> Ok(list.reverse(reversed))
+    ["", ..rest] -> normalize(rest, reversed)
+    [".", ..rest] -> normalize(rest, reversed)
+    ["..", ..rest] -> match reversed {
+      [] -> Error("path escapes the site root")
+      [_, ..parent] -> normalize(rest, parent)
+    }
+    [part, ..rest] -> normalize(rest, [part, ..reversed])
+  }
+}
+
+scan(chars: List(String), found: List(#(String, String))) -> List(
+  #(String, String)
+) {
+  match chars {
+    [] -> list.reverse(found)
+    ["<", "!", "-", "-", ..rest] -> scan(
+      skip_until(rest, ["-", "-", ">"]),
+      found
+    )
+    ["<", ..rest] -> {
+      let #(tag, rest) = tag(rest, "", [])
+      let #(name, fields) = word(tag, [])
+      let name = string.lowercase(name)
+      let found = list.concat(list.reverse(attrs(fields, [])), found)
+      let rest = match name == "script" || name == "style" {
+        True -> skip_until(rest, string.split("</" + name + ">", ""))
+        False -> rest
+      }
+      scan(rest, found)
+    }
+    [_, ..rest] -> scan(rest, found)
+  }
+}
+
+tag(chars: List(String), quote: String, done: List(String)) -> #(
+  List(String),
+  List(String)
+) {
+  match chars {
+    [] -> #(list.reverse(done), [])
+    [">", ..rest] if quote == "" -> #(list.reverse(done), rest)
+    [char, ..rest] -> {
+      let next = match quote {
+        "" if char == "\"" || char == "'" -> char
+        _ if char == quote -> ""
+        _ -> quote
+      }
+      tag(rest, next, [char, ..done])
+    }
+  }
+}
+
+attrs(chars: List(String), done: List(#(String, String))) -> List(
+  #(String, String)
+) {
+  let chars = spaces(chars)
+  match chars {
+    [] -> list.reverse(done)
+    _ -> {
+      let #(name, rest) = word(chars, [])
+      match spaces(rest) {
+        ["=", ..rest] -> {
+          let #(value, rest) = attr_value(spaces(rest))
+          attrs(rest, [#(string.lowercase(name), entities(value)), ..done])
+        }
+        [_, ..rest] if name == "" -> attrs(rest, done)
+        rest -> attrs(rest, done)
+      }
+    }
+  }
+}
+
+word(chars: List(String), done: List(String)) -> #(String, List(String)) {
+  match chars {
+    [] -> #(list.reverse(done) |> string.join(""), [])
+    [char, ..] if list.contains([" ", "\n", "\r", "\t", "=", "/", ">"], char) -> #(
+      list.reverse(done) |> string.join(""),
+      chars
+    )
+    [char, ..rest] -> word(rest, [char, ..done])
+  }
+}
+
+spaces(chars: List(String)) -> List(String) {
+  match chars {
+    [char, ..rest] if list.contains([" ", "\n", "\r", "\t"], char) -> spaces(
+      rest
+    )
+    _ -> chars
+  }
+}
+
+attr_value(chars: List(String)) -> #(String, List(String)) {
+  match chars {
+    [quote, ..rest] if quote == "\"" || quote == "'" -> quoted(rest, quote, [])
+    _ -> unquoted(chars, [])
+  }
+}
+
+quoted(chars: List(String), quote: String, done: List(String)) -> #(
+  String,
+  List(String)
+) {
+  match chars {
+    [] -> #(list.reverse(done) |> string.join(""), [])
+    [char, ..rest] if char == quote -> #(
+      list.reverse(done) |> string.join(""),
+      rest
+    )
+    [char, ..rest] -> quoted(rest, quote, [char, ..done])
+  }
+}
+
+skip_until(chars: List(String), ending: List(String)) -> List(String) {
+  match chars {
+    [] -> []
+    [_, ..rest] -> match list.map(
+      list.take(chars, list.length(ending)),
+      string.lowercase
+    ) == ending {
+      True -> list.drop(chars, list.length(ending))
+      False -> skip_until(rest, ending)
+    }
+  }
+}
+
+entities(value: String) -> String {
+  list.fold(
+    [
+      #("&quot;", "\""),
+      #("&#39;", "'"),
+      #("&lt;", "<"),
+      #("&gt;", ">"),
+      #("&amp;", "&")
+    ],
+    value,
+    fn(value, pair) { string.replace(value, pair.0, pair.1) }
+  )
+}
+
+unquoted(chars: List(String), done: List(String)) -> #(String, List(String)) {
+  match chars {
+    [] -> #(list.reverse(done) |> string.join(""), [])
+    [char, ..] if list.contains([" ", "\n", "\r", "\t"], char) -> #(
+      list.reverse(done) |> string.join(""),
+      chars
+    )
+    [char, ..rest] -> unquoted(rest, [char, ..done])
+  }
+}
+
+iri(value: String) -> String {
+  string.split(value, "") |> list.map(fn(char) {
+    match list.first(string.to_list(char)) {
+      Some(code) if code > 127 || code == 32 -> uri.percent_encode(char)
+      _ -> char
+    }
+  }) |> string.join("")
+}

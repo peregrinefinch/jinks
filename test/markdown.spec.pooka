@@ -1,0 +1,85 @@
+// SPDX-License-Identifier: Apache-2.0
+module markdown_test
+
+import jinks/markdown
+import jinks/highlight
+import pooka/json
+import pooka/string
+import poke/should
+
+test "duplicate headings and explicit suffixes keep unique document addresses" {
+  let #(body, outline) = markdown.author(
+    "# Owl\n\n## Owl\n\n## Owl-1\n\n## *Owl*",
+    False
+  )
+  should.be_true(string.contains(body, "id=\"owl\""))
+  should.be_true(string.contains(body, "id=\"owl-1\""))
+  should.be_true(string.contains(body, "id=\"owl-1-1\""))
+  should.be_true(string.contains(body, "id=\"owl-2\""))
+  should.be_true(string.contains(json.encode(outline), "\"text\":\"Owl\""))
+}
+
+test "fenced headings stay code and unsafe language labels stay escaped" {
+  let #(body, outline) = markdown.author(
+    "```unknown\n# Not a heading\n<script>bad()</script>\n```",
+    False
+  )
+  should.equal(outline, json.JArray([]))
+  should.be_false(string.contains(body, "<script>"))
+  should.be_true(string.contains(body, "&lt;script&gt;"))
+  let source = highlight.render("<script>\"<&\"</script>", "pooka")
+  should.be_false(string.contains(source, "<script>"))
+  should.be_true(string.contains(source, "tok-string"))
+}
+
+test "authored raw HTML stays escaped in paragraphs tables quotes and lists" {
+  let source = "A **<b>small</b>** owl.\n\n> <em>quote</em>\n\n- <i>list</i>\n\n| Name |\n| --- |\n| <b>owl</b> |\n\n<div>block</div>"
+  let #(body, _) = markdown.author(source, False)
+  should.be_false(string.contains(body, "<b>"))
+  should.be_false(string.contains(body, "<em>quote"))
+  should.be_false(string.contains(body, "<i>"))
+  should.be_false(string.contains(body, "<div>"))
+  should.be_true(string.contains(body, "&lt;b&gt;"))
+  should.be_true(string.contains(body, "<table>"))
+  let #(trusted, _) = markdown.author(source, True)
+  should.be_true(string.contains(trusted, "<b>small</b>"))
+  should.be_true(string.contains(trusted, "<div>block</div>"))
+}
+
+test "task lists and strikethrough use the selected GFM extensions" {
+  let #(body, _) = markdown.author("- [x] ~~Done~~\n- [ ] Later", False)
+  should.be_true(string.contains(body, "checkbox"))
+  should.be_true(string.contains(body, "<del>Done</del>"))
+}
+
+test "terminal snapshots preserve escaped coloured additions and removals" {
+  let source = highlight.render(
+    "  ✓ good\n  ✗ bad\n  9 - <old>\n  9 + <new>",
+    "snapshot"
+  )
+  should.be_true(string.contains(source, "t-pass"))
+  should.be_true(string.contains(source, "t-fail"))
+  should.be_true(string.contains(source, "t-diff-add"))
+  should.be_true(string.contains(source, "t-diff-remove"))
+  should.be_false(string.contains(source, "<old>"))
+}
+
+test "plain file trees retain folder colours spacing and escaped notes" {
+  let tree = "lantern/\n  src/main.pooka  <entry point>\n  pooka.toml\n"
+  let shown = highlight.render(tree, "text")
+  should.be_true(string.contains(shown, "t-dir"))
+  should.be_true(
+    string.contains(shown, "  <span class=\"t-dir\">src/</span>main.pooka")
+  )
+  should.be_true(string.contains(shown, "&lt;entry point&gt;"))
+  should.be_false(string.contains(shown, "<entry point>"))
+  should.be_false(highlight.is_tree("Visit https://example.org for a page."))
+  should.equal(highlight.render("<unknown>", "unknown"), "&lt;unknown&gt;")
+}
+
+test "unknown language fences do not accidentally become file trees" {
+  should.equal(
+    highlight.render("src/\n  main.pooka", "unrecognised"),
+    "src/\n  main.pooka"
+  )
+}

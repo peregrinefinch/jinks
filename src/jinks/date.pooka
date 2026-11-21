@@ -1,0 +1,146 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// Calendar dates are publication days, not instants wearing an unspecified
+//// timezone. Validate the written day before using it in a URL or sort key.
+//// Timestamp/timezone support is deliberately a separate future feature.
+module date
+
+import pooka/int
+import pooka/string
+import pooka/list
+
+class Date(year: String, month: String, day: String)
+
+external _Calendar from erlang "erlang" {
+  universaltime() -> #(#(Int, Int, Int), #(Int, Int, Int))
+}
+
+/// ```pooka
+/// assert date.parse("2024-02-29") == Ok(date.Date("2024", "02", "29"))
+/// let assert Error(_) = date.parse("2025-02-29")
+/// ```
+parse(source: String) -> Result(Date, String) {
+  let _ = match string.length(source) == 10 && list.all(
+    string.to_list(string.replace(source, "-", "")),
+    fn(c) { c >= 48 && c <= 57 }
+  ) {
+    True -> Ok(Nil)
+    False -> Error("date must be YYYY-MM-DD: " + source)
+  }?
+  match string.split(source, "-") {
+    [year, month, day] -> {
+      let y = number(year)?
+      let m = number(month)?
+      let d = number(day)?
+      let leap = y % 400 == 0 || (y % 4 == 0 && y % 100 != 0)
+      let maximum = match m {
+        2 -> match leap {
+          True -> 29
+          False -> 28
+        }
+        4 -> 30
+        6 -> 30
+        9 -> 30
+        11 -> 30
+        _ -> 31
+      }
+      match string.length(year) == 4 && string.length(month) == 2 && string.length(
+        day
+      ) == 2 && y >= 1 && m >= 1 && m <= 12 && d >= 1 && d <= maximum {
+        True -> Ok(Date(year, month, day))
+        False -> Error("invalid calendar date: " + source)
+      }
+    }
+    _ -> Error("date must be YYYY-MM-DD: " + source)
+  }
+}
+
+number(source: String) -> Result(Int, String) {
+  match int.parse(source) {
+    Ok(n) -> Ok(n)
+    Error(_) -> Error("invalid date number")
+  }
+}
+
+today() -> String {
+  let #(day, _) = _Calendar.universaltime()
+  string.pad_start(int.to_string(day.0), 4, "0") + "-" + string.pad_start(
+    int.to_string(day.1),
+    2,
+    "0"
+  ) + "-" + string.pad_start(int.to_string(day.2), 2, "0")
+}
+
+/// Capture UTC once for a whole build, including feeds and template functions.
+timestamp() -> String {
+  let #(day, clock) = _Calendar.universaltime()
+  string.pad_start(int.to_string(day.0), 4, "0") + "-" + string.pad_start(
+    int.to_string(day.1),
+    2,
+    "0"
+  ) + "-" + string.pad_start(int.to_string(day.2), 2, "0") + "T" + string.pad_start(
+    int.to_string(clock.0),
+    2,
+    "0"
+  ) + ":" + string.pad_start(int.to_string(clock.1), 2, "0") + ":" + string.pad_start(
+    int.to_string(clock.2),
+    2,
+    "0"
+  ) + "Z"
+}
+
+/// RSS accepts a calendar date with an explicit UTC time; the optional weekday
+/// is omitted instead of guessing it from the local machine's timezone.
+rfc822(source: String) -> Result(String, String) {
+  let day = parse(source)?
+  let month = number(day.month)?
+  let names = [
+    "Jan",
+    "Feb",
+    "Mar",
+    "Apr",
+    "May",
+    "Jun",
+    "Jul",
+    "Aug",
+    "Sep",
+    "Oct",
+    "Nov",
+    "Dec"
+  ]
+  let name = match list.first(list.drop(names, month - 1)) {
+    Some(name) -> name
+    None -> ""
+  }
+  Ok(day.day + " " + name + " " + day.year + " 00:00:00 GMT")
+}
+
+validate_timestamp(source: String) -> Result(Nil, String) {
+  let _ = parse(string.slice(source, 0, 10))?
+  match #(
+    string.length(source),
+    string.slice(source, 10, 1),
+    string.slice(source, 19, 1),
+    string.split(string.slice(source, 11, 8), ":")
+  ) {
+    #(20, "T", "Z", [hours, minutes, seconds]) -> {
+      let _ = match list.all(
+        string.to_list(hours + minutes + seconds),
+        fn(code) { code >= 48 && code <= 57 }
+      ) {
+        True -> Ok(Nil)
+        False -> Error("build timestamp time fields must contain digits")
+      }?
+      let h = number(hours)?
+      let m = number(minutes)?
+      let s = number(seconds)?
+      match string.length(hours) == 2 && string.length(minutes) == 2 && string.length(
+        seconds
+      ) == 2 && h >= 0 && h < 24 && m >= 0 && m < 60 && s >= 0 && s < 60 {
+        True -> Ok(Nil)
+        False -> Error("build timestamp must be YYYY-MM-DDTHH:MM:SSZ")
+      }
+    }
+    _ -> Error("build timestamp must be YYYY-MM-DDTHH:MM:SSZ")
+  }
+}

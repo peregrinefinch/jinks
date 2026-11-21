@@ -1,0 +1,140 @@
+// SPDX-License-Identifier: Apache-2.0
+module core_test
+
+import jinks
+import jinks/config
+import jinks/content
+import jinks/route
+import jinks/template
+import poke/should
+import pooka/string
+import tuck
+
+test "configuration defaults and explicitly typed values" {
+  let site = should.be_ok(config.parse("title = \"Owl\""))
+  should.equal(site.title, "Owl")
+  should.equal(site.output, "public")
+  should.equal(site.theme, "minimal")
+  let _ = should.be_error(config.parse("title = 42"))
+  let _ = should.be_error(config.parse("title = ["))
+}
+
+test "output paths cannot consume source directories or escape the site" {
+  loop name in [
+    "content",
+    "themes",
+    "static",
+    "layouts",
+    "..",
+    "/tmp",
+    "a/../b",
+    "",
+    "a\\b",
+    "C:/temp"
+  ] {
+    let _ = should.be_error(
+      config.parse(
+        "output-dir = \"" + string.replace(name, "\\", "\\\\") + "\""
+      )
+    )
+  }
+}
+
+test "clean routes preserve index pages and nested directories" {
+  should.equal(route.output("index.md"), Ok("index.html"))
+  should.equal(route.output("notes/owl.md"), Ok("notes/owl/index.html"))
+  should.equal(route.output("notes/index.md"), Ok("notes/index.html"))
+  should.equal(route.url("notes/index.html"), "/notes/")
+  let _ = should.be_error(route.output("../owl.md"))
+  let _ = should.be_error(route.output("owl.txt"))
+}
+
+test "front matter is TOML and fenced template syntax stays literal" {
+  let page = should.be_ok(
+    content.parse(
+      "owl.md",
+      "---\ntitle = \"Owl\"\ndraft = true\n---\n\n```text\n{{ not_a_template }}\n```"
+    )
+  )
+  should.equal(page.title, "Owl")
+  should.be_true(page.draft)
+  should.be_true(string.contains(page.body, "{{ not_a_template }}"))
+  let _ = should.be_error(
+    content.parse("owl.md", "---\ndraft = \"yes\"\n---\nhello")
+  )
+}
+
+test "theme rendering escapes titles but deliberately preserves rendered Markdown" {
+  let library = should.be_ok(
+    tuck.add(
+      tuck.library(),
+      "page.html.tuck",
+      "<title>{{ page.title }}</title>{{ content | safe }}"
+    )
+  )
+  let site = should.be_ok(config.parse(""))
+  let page = should.be_ok(
+    content.parse("index.md", "---\ntitle = \"<Owl>\"\n---\n# Welcome")
+  )
+  let output = should.be_ok(template.render(library, site, page))
+  should.be_true(string.contains(output, "&lt;Owl&gt;"))
+  should.be_true(string.contains(output, "<h1 id=\"welcome\">Welcome</h1>"))
+}
+
+test "commands have their own help and failures stay failures" {
+  should.be_true(
+    string.contains(
+      should.be_ok(jinks.command(["init", "--help"])),
+      "config.toml"
+    )
+  )
+  should.be_true(
+    string.contains(should.be_ok(jinks.command(["build", "--help"])), "Usage:")
+  )
+  let _ = should.be_error(jinks.command(["unknown"]))
+}
+
+test "template parameters preserve nested types and remain escaped" {
+  let site = should.be_ok(
+    config.parse(
+      "[params]\ntagline = \"<workshop>\"\n[params.owner]\nname = \"Finch\""
+    )
+  )
+  let page = should.be_ok(
+    content.parse("index.md", "---\n[params]\ncount = 3\n---\nHello")
+  )
+  let library = should.be_ok(
+    tuck.add(
+      tuck.library(),
+      "page.html.tuck",
+      "{{ site.params.tagline }} {{ site.params.owner.name }} {{ page.params.count }} {{ params.count }}"
+    )
+  )
+  should.equal(
+    should.be_ok(template.render(library, site, page)),
+    "&lt;workshop&gt; Finch 3 3"
+  )
+  let _ = should.be_error(config.parse("params = 3"))
+  let _ = should.be_error(config.parse("[params]\namount = inf"))
+}
+
+test "output descendants must not overlap source directories" {
+  loop name in [
+    "content/generated",
+    "themes/build",
+    "static/output",
+    "layouts/generated",
+    ".jinks",
+    ".jinks/cache"
+  ] {
+    let _ = should.be_error(config.parse("output-dir = \"" + name + "\""))
+  }
+}
+
+test "unknown configuration is diagnosed rather than silently ignored" {
+  let error = should.be_error(config.parse("content-dir = \"elsewhere\""))
+  should.be_true(string.contains(error, "unsupported setting: content-dir"))
+  loop name in [".git", ".github", "config.toml", "public/.cache"] {
+    let _ = should.be_error(config.parse("output-dir = \"" + name + "\""))
+  }
+}

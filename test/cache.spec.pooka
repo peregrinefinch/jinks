@@ -1,0 +1,55 @@
+// SPDX-License-Identifier: Apache-2.0
+module cache_test
+
+import jinks
+import jinks/cache
+import jinks/scaffold
+import jinks/storage
+import poke/should
+import pooka/file
+import pooka/int
+import pooka/json
+import pooka/path
+import pooka/process
+
+site(label: String) -> String {
+  let root = "build/jinks-tests/" + int.to_string(process.pid()) + "/cache-" + label
+  let _ = should.be_ok(scaffold.create(root))
+  root
+}
+
+test "provider caches expire at the injected deadline" {
+  let root = site("expiry")
+  should.equal(cache.get(root, "birds", 10), Ok(None))
+  let _ = should.be_ok(cache.put(root, "birds", 10, 100, json.JString("Owl")))
+  should.equal(cache.get(root, "birds", 109), Ok(Some(json.JString("Owl"))))
+  should.equal(cache.get(root, "birds", 110), Ok(None))
+  let _ = should.be_ok(
+    cache.put(root, "birds", 110, 100, json.JString("Finch"))
+  )
+  should.equal(cache.get(root, "birds", 111), Ok(Some(json.JString("Finch"))))
+}
+
+test "malformed cache entries are misses and unsafe keys are errors" {
+  let root = site("invalid")
+  let _ = should.be_ok(
+    storage.write(path.join([root, ".jinks/cache/birds.json"]), "not json")
+  )
+  should.equal(cache.get(root, "birds", 10), Ok(None))
+  let _ = should.be_error(cache.get(root, "../secret", 10))
+  let _ = should.be_error(cache.put(root, "birds", 10, 0, json.JNull()))
+}
+
+test "cache cleanup preserves neighbouring author files" {
+  let root = site("clear")
+  let _ = should.be_ok(cache.put(root, "birds", 10, 100, json.JNull()))
+  let _ = should.be_ok(
+    storage.write(path.join([root, ".jinks/keep.txt"]), "keep")
+  )
+  let _ = should.be_ok(jinks.command(["clean", root, "--cache"]))
+  should.equal(cache.get(root, "birds", 11), Ok(None))
+  should.equal(
+    should.be_ok(file.read(path.join([root, ".jinks/keep.txt"]))),
+    "keep"
+  )
+}

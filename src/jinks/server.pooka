@@ -1,0 +1,354 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// A preview is a reader of generated output. It does not mount the source
+//// tree, and its reload client is added to HTTP responses rather than saved
+//// in production pages. The transport knows sockets; this module knows pages.
+module server
+
+import jinks/boundary
+import pooka/bit_array
+import pooka/file
+import pooka/json
+import pooka/int
+import pooka/list
+import pooka/path
+import pooka/string
+import pooka/uri
+
+class Handle {}
+
+class Running(
+  handle: Handle,
+  port: Int,
+  output: String,
+  live: Bool,
+  mount: String
+)
+
+class Response(status: Int, content_type: String, body: BitArray)
+
+external _Http from erlang "jinks_http" {
+  start(
+    host: String,
+    port: Int,
+    live: Bool,
+    handler: fn(String, String, String) -> #(Int, String, BitArray)
+  ) -> Result(#(Handle, Int), String)
+
+  stop(handle: Handle) -> Result(Nil, String)
+
+  update(handle: Handle, state: String) -> Result(Nil, String)
+
+  target(
+    handle: Handle,
+    handler: fn(String, String, String) -> #(Int, String, BitArray)
+  ) -> Result(Nil, String)
+
+  alive(handle: Handle) -> Bool
+}
+
+/// Port zero asks the OS for a free port, useful for independent server tests.
+start(output: String, host: String, port: Int, live: Bool) -> Result(
+  Running,
+  String
+) {
+  start_mounted(output, host, port, live, "")
+}
+
+/// Preview a base-path deployment at the same path it uses on its static host.
+/// The mount is decoded once alongside request paths, never as a file root.
+start_site(
+  output: String,
+  host: String,
+  port: Int,
+  live: Bool,
+  base_url: String
+) -> Result(Running, String) {
+  start_mounted(output, host, port, live, mount(base_url)?)
+}
+
+mount(base_url: String) -> Result(String, String) {
+  let address = match uri.parse(base_url) {
+    Ok(address) -> Ok(address)
+    Error(_) -> Error("invalid preview base-url")
+  }?
+  relative(match address.path {
+    "" -> "/"
+    path -> path
+  })
+}
+
+mount_url(mount: String) -> String {
+  match mount {
+    "" -> "/"
+    _ -> "/" + string.join(
+      list.map(string.split(mount, "/"), uri.percent_encode),
+      "/"
+    ) + "/"
+  }
+}
+
+start_mounted(
+  output: String,
+  host: String,
+  port: Int,
+  live: Bool,
+  mount: String
+) -> Result(Running, String) {
+  let _ = match port >= 0 && port <= 65535 {
+    True -> Ok(Nil)
+    False -> Error("port must be between 0 and 65535")
+  }?
+  let _ = match host == "127.0.0.1" || host == "::1" {
+    True -> Ok(Nil)
+    False -> Error("preview host must be loopback: 127.0.0.1 or ::1")
+  }?
+  let _ = boundary.tree(output)?
+  let _ = match file.is_directory(output) {
+    Ok(True) -> Ok(Nil)
+    _ -> Error("preview output directory does not exist")
+  }?
+  let #(handle, actual) = _Http.start(
+    host,
+    port,
+    live,
+    handler_at(output, live, mount)
+  )?
+  Ok(Running(handle, actual, output, live, mount))
+}
+
+handler(output: String, live: Bool) -> fn(String, String, String) -> #(
+  Int,
+  String,
+  BitArray
+) {
+  handler_at(output, live, "")
+}
+
+handler_at(output: String, live: Bool, mount: String) -> fn(
+  String,
+  String,
+  String
+) -> #(Int, String, BitArray) {
+  fn(method, target, state) {
+    let revision = match json.decode(state) {
+      Ok(doc) -> match json.get(doc, "revision") {
+        Some(json.JInt(value)) -> value
+        _ -> 0
+      }
+      Error(_) -> 0
+    }
+    let reply = respond_at(output, live, method, target, revision, mount)
+    #(reply.status, reply.content_type, reply.body)
+  }
+}
+
+stop(server: Running) -> Result(Nil, String) {
+  _Http.stop(server.handle)
+}
+
+alive(server: Running) -> Bool {
+  _Http.alive(server.handle)
+}
+
+/// Retarget only after a successful build if config.toml changes output-dir.
+retarget(server: Running, output: String) -> Result(Running, String) {
+  retarget_mounted(server, output, server.mount)
+}
+
+retarget_site(server: Running, output: String, base_url: String) -> Result(
+  Running,
+  String
+) {
+  retarget_mounted(server, output, mount(base_url)?)
+}
+
+retarget_mounted(server: Running, output: String, mount: String) -> Result(
+  Running,
+  String
+) {
+  let _ = boundary.tree(output)?
+  let _ = match file.is_directory(output) {
+    Ok(True) -> Ok(Nil)
+    _ -> Error("preview output directory does not exist")
+  }?
+  let _ = _Http.target(server.handle, handler_at(output, server.live, mount))?
+  Ok(Running(server.handle, server.port, output, server.live, mount))
+}
+
+notify(server: Running, revision: Int, problem: String) -> Result(Nil, String) {
+  notify_styles(server, revision, problem, False)
+}
+
+/// CSS-only events may replace stylesheet links. All other edits, missed
+/// revisions and failed loads keep the ordinary full-page reload behaviour.
+notify_styles(
+  server: Running,
+  revision: Int,
+  problem: String,
+  styles_only: Bool
+) -> Result(Nil, String) {
+  _Http.update(server.handle, json.encode(json.JObject([
+    #("revision", json.JInt(revision)),
+    #("error", json.JString(problem)),
+    #("styles_only", json.JBool(styles_only))
+  ])))
+}
+
+/// Decode once, then reject dot segments, backslashes, control characters and
+/// hidden files. Query strings never become part of a filename.
+relative(target: String) -> Result(String, String) {
+  let raw = match string.split(target, "?") {
+    [first, ..rest] -> first
+    [] -> ""
+  }
+  let decoded = match uri.percent_decode(raw) {
+    Ok(value) -> Ok(value)
+    Error(_) -> Error("invalid percent-encoded path")
+  }?
+  let _ = match string.starts_with(decoded, "/") && !string.contains(
+    decoded,
+    "\\"
+  ) && !string.contains(decoded, ":") && !list.any(
+    string.to_list(decoded),
+    fn(code) { code < 32 || code == 127 }
+  ) {
+    True -> Ok(Nil)
+    False -> Error("invalid request path")
+  }?
+  let parts = list.filter(string.split(decoded, "/"), fn(part) { part != "" })
+  match list.any(parts, fn(part) { string.starts_with(part, ".") }) {
+    True -> Error("hidden files and dot segments are not served")
+    False -> Ok(string.join(parts, "/"))
+  }
+}
+
+text(status: Int, body: String) -> Response {
+  Response(status, "text/plain; charset=utf-8", bit_array.from_string(body))
+}
+
+respond(
+  output: String,
+  live: Bool,
+  method: String,
+  target: String,
+  revision: Int
+) -> Response {
+  respond_at(output, live, method, target, revision, "")
+}
+
+respond_at(
+  output: String,
+  live: Bool,
+  method: String,
+  target: String,
+  revision: Int,
+  mount: String
+) -> Response {
+  match method == "GET" || method == "HEAD" {
+    False -> text(405, "Method not allowed")
+    True -> match relative(target) {
+      Error(_) -> text(403, "Forbidden")
+      Ok("__jinks/client.js") -> match live {
+        True -> Response(
+          200,
+          "text/javascript; charset=utf-8",
+          bit_array.from_string(client())
+        )
+        False -> text(404, "Not found")
+      }
+      Ok(name) -> match unmount(name, mount) {
+        None -> text(404, "Not found")
+        Some(name) -> {
+          let selected = match name {
+            "" -> "index.html"
+            _ -> name
+          }
+          match boundary.guard(output, selected) {
+            Error(_) -> text(403, "Forbidden")
+            Ok(_) -> {
+              let selected = match file.is_directory(
+                path.join([output, selected])
+              ) {
+                Ok(True) -> selected + "/index.html"
+                _ -> selected
+              }
+              match read(output, selected, live, revision) {
+                Ok(reply) -> reply
+                Error(_) -> match read(output, "404.html", live, revision) {
+                  Ok(reply) -> Response(404, reply.content_type, reply.body)
+                  Error(_) -> text(404, "Not found")
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+/// A prefix must end at a segment boundary: /blog never matches /blogger.
+unmount(name: String, mount: String) -> Option(String) {
+  match True {
+    _ if mount == "" -> Some(name)
+    _ if name == mount -> Some("")
+    _ if string.starts_with(name, mount + "/") -> Some(
+      string.drop_start(name, string.length(mount) + 1)
+    )
+    _ -> None
+  }
+}
+
+read(output: String, name: String, live: Bool, revision: Int) -> Result(
+  Response,
+  String
+) {
+  let _ = boundary.guard(output, name)?
+  let bytes = match file.read_bytes(path.join([output, name])) {
+    Ok(value) -> Ok(value)
+    Error(e) -> Error(e.message)
+  }?
+  let content_type = mime(name)
+  let bytes = match live && content_type == "text/html; charset=utf-8" {
+    False -> bytes
+    True -> match bit_array.to_string(bytes) {
+      Error(_) -> bytes
+      Ok(source) -> bit_array.from_string(
+        source + "\n<script src=\"/__jinks/client.js\" data-jinks-revision=\"" + int.to_string(
+          revision
+        ) + "\"></script>\n"
+      )
+    }
+  }
+  Ok(Response(200, content_type, bytes))
+}
+
+mime(name: String) -> String {
+  match path.extension(string.lowercase(name)) {
+    Some(".html") -> "text/html; charset=utf-8"
+    Some(".htm") -> "text/html; charset=utf-8"
+    Some(".css") -> "text/css; charset=utf-8"
+    Some(".js") -> "text/javascript; charset=utf-8"
+    Some(".mjs") -> "text/javascript; charset=utf-8"
+    Some(".webmanifest") -> "application/manifest+json"
+    Some(".json") -> "application/json"
+    Some(".xml") -> "application/xml"
+    Some(".svg") -> "image/svg+xml"
+    Some(".png") -> "image/png"
+    Some(".jpg") -> "image/jpeg"
+    Some(".jpeg") -> "image/jpeg"
+    Some(".gif") -> "image/gif"
+    Some(".webp") -> "image/webp"
+    Some(".ico") -> "image/x-icon"
+    Some(".woff") -> "font/woff"
+    Some(".woff2") -> "font/woff2"
+    Some(".txt") -> "text/plain; charset=utf-8"
+    _ -> "application/octet-stream"
+  }
+}
+
+/// Errors use textContent, so a template diagnostic cannot become browser HTML.
+client() -> String {
+  "(() => {\n  const stamp = document.currentScript?.getAttribute('data-jinks-revision');\n  let revision = stamp == null ? null : Number(stamp);\n  const events = new EventSource('/__jinks/events');\n  let panel;\n\n  function refreshStyles(next) {\n    const links = [...document.querySelectorAll('link[rel~=\"stylesheet\"][href]')]\n      .filter(link => new URL(link.href, location.href).origin === location.origin);\n    if (!links.length) { location.reload(); return; }\n    for (const old of links) {\n      const fresh = old.cloneNode();\n      const url = new URL(old.href, location.href);\n      url.searchParams.set('__jinks', String(next));\n      fresh.href = url.href;\n      fresh.onload = () => old.remove();\n      fresh.onerror = () => location.reload();\n      old.after(fresh);\n    }\n  }\n\n  events.onmessage = event => {\n    const state = JSON.parse(event.data);\n    if (state.error) {\n      if (!panel) {\n        panel = document.createElement('pre');\n        panel.setAttribute('role', 'alert');\n        panel.style.cssText = 'position:fixed;inset:1rem;z-index:2147483647;overflow:auto;padding:1.5rem;background:#211c1b;color:#fffef9;border:2px solid #ff891f;white-space:pre-wrap;font:16px/1.6 monospace';\n        document.body.append(panel);\n      }\n      panel.textContent = 'Jinks could not rebuild this page\\n\\n' + state.error;\n    } else {\n      if (panel) { panel.remove(); panel = null; }\n      if (revision !== null && revision !== state.revision) {\n        // A reconnect may have missed an HTML edit before the CSS save.\n        if (state.styles_only && state.revision === revision + 1) refreshStyles(state.revision);\n        else location.reload();\n      }\n    }\n    revision = state.revision;\n  };\n})();\n"
+}

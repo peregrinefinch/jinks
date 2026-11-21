@@ -1,0 +1,79 @@
+// SPDX-License-Identifier: Apache-2.0
+module links_test
+
+import jinks/links
+import poke/should
+import pooka/string
+
+test "local links resolve Unicode paths queries and fragments" {
+  let pages = [
+    #(
+      "index.html",
+      "<a href='/notes/owl/?q=a&amp;b=c#caf%C3%A9'>Owl</a><img src=/icon.svg>"
+    ),
+    #(
+      "notes/owl/index.html",
+      "<h2 id='café'>Hello</h2><a href='../../'>Home</a><a href='#café'>Here</a>"
+    )
+  ]
+  should.equal(links.check("https://example.org", pages, ["icon.svg"]), Ok(Nil))
+}
+
+test "missing destinations and anchors report the originating page" {
+  let error = should.be_error(
+    links.check(
+      "https://example.org",
+      [#("index.html", "<a href='/missing/'>Missing</a>")],
+      []
+    )
+  )
+  should.be_true(string.contains(error, "index.html: broken local link"))
+  let _ = should.be_error(
+    links.check(
+      "https://example.org",
+      [#("index.html", "<a href='#missing'>Missing</a>")],
+      []
+    )
+  )
+}
+
+test "scripts styles and comments are not scanned as page markup" {
+  let source = "<!-- <a href='/missing/'> --> <SCRIPT>let x = '<a href=\"/bad/\">';</SCRIPT><style>.x{content:'<a href=/bad>'}</style><a href='https://other.example/missing/'>External</a>"
+  should.equal(
+    links.check("https://example.org", [#("index.html", source)], []),
+    Ok(Nil)
+  )
+}
+
+test "deployment prefixes are removed only for local target lookup" {
+  let pages = [
+    #("index.html", "<a href='/blog/notes/'>Notes</a>"),
+    #("notes/index.html", "<a href='../'>Home</a>")
+  ]
+  should.equal(links.check("https://example.org/blog/", pages, []), Ok(Nil))
+  let _ = should.be_error(
+    links.check(
+      "https://example.org/blog/",
+      [#("index.html", "<a href='/notes/'>Escaped prefix</a>")],
+      []
+    )
+  )
+}
+
+test "parent traversal cannot escape the site root" {
+  let _ = should.be_error(
+    links.check(
+      "https://example.org",
+      [#("index.html", "<a href='../../secret'>Secret</a>")],
+      []
+    )
+  )
+}
+
+test "quoted greater-than characters do not end an attribute early" {
+  let pages = [
+    #("index.html", "<a title='a > b' href='/target/'>Read</a>"),
+    #("target/index.html", "Target")
+  ]
+  should.equal(links.check("https://example.org", pages, []), Ok(Nil))
+}

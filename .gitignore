@@ -1,0 +1,6 @@
+/build
+*.beam
+*.ez
+erl_crash.dump
+.DS_Store
+/test/snapshots/*.new

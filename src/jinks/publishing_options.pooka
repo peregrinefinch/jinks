@@ -1,0 +1,94 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// Machine-readable neighbours belong to the same publication as the pages.
+//// They are opt-in, so an existing authored feed never gets overwritten by
+//// a newly invented default. Unknown settings are errors, not silent typos.
+module publishing_options
+
+import tome
+import pooka/list
+
+class Options(
+  feed: Bool,
+  sitemap: Bool,
+  search: Bool,
+  robots: Bool,
+  collection: String,
+  format: String,
+  limit: Int,
+  title: Option(String),
+  description: Option(String)
+)
+
+parse(doc: tome.Toml) -> Result(Options, String) {
+  let table = match tome.get(doc, "publishing") {
+    None -> Ok(tome.TTable([]))
+    Some(tome.TTable(entries)) -> {
+      let _ = list.try_fold(entries, Nil, fn(_, entry) {
+        match list.contains(
+          [
+            "feed",
+            "sitemap",
+            "search",
+            "robots",
+            "collection",
+            "feed-format",
+            "feed-limit",
+            "feed-title",
+            "feed-description"
+          ],
+          entry.0
+        ) {
+          True -> Ok(Nil)
+          False -> Error("unsupported publishing setting: " + entry.0)
+        }
+      })?
+      Ok(tome.TTable(entries))
+    }
+    _ -> Error("publishing must be a table")
+  }?
+  let collection = match tome.get(table, "collection") {
+    None -> Ok("posts")
+    Some(tome.TString(value)) if value != "" -> Ok(value)
+    _ -> Error("publishing.collection must be a nonempty string")
+  }?
+  let format = match tome.get(table, "feed-format") {
+    None -> Ok("atom")
+    Some(tome.TString(value)) if value == "atom" || value == "rss" -> Ok(value)
+    _ -> Error("publishing.feed-format must be atom or rss")
+  }?
+  let limit = match tome.get(table, "feed-limit") {
+    None -> Ok(20)
+    Some(tome.TInt(value)) if value > 0 && value <= 1000 -> Ok(value)
+    _ -> Error("publishing.feed-limit must be an integer between 1 and 1000")
+  }?
+  Ok(
+    Options(
+      flag(table, "feed")?,
+      flag(table, "sitemap")?,
+      flag(table, "search")?,
+      flag(table, "robots")?,
+      collection,
+      format,
+      limit,
+      optional_text(table, "feed-title")?,
+      optional_text(table, "feed-description")?
+    )
+  )
+}
+
+flag(table: tome.Toml, name: String) -> Result(Bool, String) {
+  match tome.get(table, name) {
+    None -> Ok(False)
+    Some(tome.TBool(value)) -> Ok(value)
+    _ -> Error("publishing." + name + " must be a Boolean")
+  }
+}
+
+optional_text(table: tome.Toml, name: String) -> Result(Option(String), String) {
+  match tome.get(table, name) {
+    None -> Ok(None)
+    Some(tome.TString(value)) -> Ok(Some(value))
+    _ -> Error("publishing." + name + " must be a string")
+  }
+}

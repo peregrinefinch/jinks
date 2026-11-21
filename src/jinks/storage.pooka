@@ -1,0 +1,68 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// Filesystem errors retain the path that caused them. Every caller gets
+//// the same Result shape, so the command boundary can explain one failure.
+module storage
+
+import jinks/boundary
+import pooka/file
+import pooka/path
+import pooka/list
+
+read(name: String) -> Result(String, String) {
+  match file.read(name) {
+    Ok(text) -> Ok(text)
+    Error(e) -> Error(e.path + ": " + e.message)
+  }
+}
+
+write(name: String, text: String) -> Result(Nil, String) {
+  let _ = match file.create_directories(path.dirname(name)) {
+    Ok(_) -> Ok(Nil)
+    Error(e) -> Error(e.path + ": " + e.message)
+  }?
+  match file.write(name, text) {
+    Ok(_) -> Ok(Nil)
+    Error(e) -> Error(e.path + ": " + e.message)
+  }
+}
+
+/// Enumerate files only. Sorting is independent of filesystem iteration order.
+files(root: String, prefix: String) -> Result(List(String), String) {
+  let _ = boundary.tree(path.join([root, prefix]))?
+  _files(root, prefix)
+}
+
+// The public entry validates the tree once; recursion must not rescan every
+// subtree at each level of a deep content directory.
+_files(root: String, prefix: String) -> Result(List(String), String) {
+  let names = match file.list_directory(path.join([root, prefix])) {
+    Ok(names) -> Ok(names)
+    Error(e) -> Error(e.path + ": " + e.message)
+  }?
+  walk(root, prefix, list.sort(names), [])
+}
+
+walk(root: String, prefix: String, names: List(String), found: List(String)) -> Result(
+  List(String),
+  String
+) {
+  match names {
+    [] -> Ok(found)
+    [name, ..rest] -> {
+      let relative = match prefix {
+        "" -> name
+        _ -> prefix + "/" + name
+      }
+      let nested = match file.is_directory(path.join([root, relative])) {
+        Ok(b) -> Ok(b)
+        Error(e) -> Error(e.path + ": " + e.message)
+      }?
+      let entries = match nested {
+        True -> _files(root, relative)
+        False -> Ok([relative])
+      }?
+      walk(root, prefix, rest, list.concat(found, entries))
+    }
+  }
+}

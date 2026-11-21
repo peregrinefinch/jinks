@@ -1,0 +1,171 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// Cut an already ordered list into windows without changing that order.
+//// The first window keeps the archive address; later windows live under its
+//// page path. Navigation links are bounded, even for a very long bookshelf.
+module pagination
+
+import jinks/route
+import jinks/listing_options
+import pooka/int
+import pooka/json
+import pooka/list
+import pooka/string
+
+class Navigation(
+  number: Int,
+  total_pages: Int,
+  total_items: Int,
+  page_size: Int,
+  output: String,
+  url: String,
+  previous: Option(String),
+  next: Option(String),
+  first: String,
+  last: String,
+  links: List(#(Int, String)),
+  first_item: Int,
+  last_item: Int
+)
+
+class Window(a) {
+  let items: List(a)
+  let nav: Navigation
+
+  new(items: List(a), navigation: Navigation) {
+    self.items = items
+    self.nav = navigation
+  }
+}
+
+/// An empty archive still has one empty first page. No page/1 alias is emitted.
+windows(items: List(a), size: Int, base: String, prefix: String) -> Result(
+  List(Window(a)),
+  String
+) {
+  let _ = match size > 0 {
+    True -> Ok(Nil)
+    False -> Error("page-size must be positive")
+  }?
+  let _ = listing_options.relative(prefix)?
+  let base_output = route.permalink(base)?
+  let base_url = route.url(base_output)
+  let _ = match string.ends_with(base_url, "/") {
+    True -> Ok(Nil)
+    False -> Error("pagination requires a directory URL")
+  }?
+  let chunks = match list.chunk(items, size) {
+    [] -> [[]]
+    chunks -> chunks
+  }
+  let total = list.length(chunks)
+  let count = list.length(items)
+  let last = route.url(output(base_url, prefix, total)?)
+  list.index_map(chunks, fn(chunk, index) { #(chunk, index + 1) }) |> list.try_map(
+    fn(entry) {
+      let number = entry.1
+      let chosen = output(base_url, prefix, number)?
+      let previous = match number > 1 {
+        True -> Ok(Some(route.url(output(base_url, prefix, number - 1)?)))
+        False -> Ok(None)
+      }?
+      let next = match number < total {
+        True -> Ok(Some(route.url(output(base_url, prefix, number + 1)?)))
+        False -> Ok(None)
+      }?
+      let lower = match number > 2 {
+        True -> number - 2
+        False -> 1
+      }
+      let upper = match number + 2 < total {
+        True -> number + 2
+        False -> total
+      }
+      let numbers = list.sort(
+        list.unique([1, total, ..list.range(lower, upper + 1)])
+      )
+      let links = list.try_map(numbers, fn(n) {
+        Ok(#(n, route.url(output(base_url, prefix, n)?)))
+      })?
+      let first_item = match count {
+        0 -> 0
+        _ -> (number - 1) * size + 1
+      }
+      let last_item = match number * size < count {
+        True -> number * size
+        False -> count
+      }
+      Ok(
+        Window(
+          entry.0,
+          Navigation(
+            number,
+            total,
+            count,
+            size,
+            chosen,
+            route.url(chosen),
+            previous,
+            next,
+            base_url,
+            last,
+            links,
+            first_item,
+            last_item
+          )
+        )
+      )
+    }
+  )
+}
+
+output(base: String, prefix: String, number: Int) -> Result(String, String) {
+  match number {
+    1 -> route.permalink(base)
+    _ -> route.permalink(
+      base + string.remove_prefix(route.url(prefix + "/index.html"), "/") + int.to_string(
+        number
+      ) + "/"
+    )
+  }
+}
+
+context(window: Window(a), project: fn(a) -> json.Json) -> json.Json {
+  let nav = window.nav
+  let links = list.index_map(nav.links, fn(link, index) {
+    let previous = match list.at(nav.links, index - 1) {
+      Some(pair) -> pair.0
+      None -> 0
+    }
+    json.JObject(
+      [
+        #("number", json.JInt(link.0)),
+        #("url", json.JString(link.1)),
+        #("current", json.JBool(link.0 == nav.number)),
+        #("gap", json.JBool(previous > 0 && link.0 > previous + 1))
+      ]
+    )
+  })
+  json.JObject([
+    #("items", json.JArray(list.map(window.items, project))),
+    #("number", json.JInt(nav.number)),
+    #("total_pages", json.JInt(nav.total_pages)),
+    #("total_items", json.JInt(nav.total_items)),
+    #("page_size", json.JInt(nav.page_size)),
+    #("url", json.JString(nav.url)),
+    #("previous", option(nav.previous)),
+    #("next", option(nav.next)),
+    #("first", json.JString(nav.first)),
+    #("last", json.JString(nav.last)),
+    #("links", json.JArray(links)),
+    #("first_item", json.JInt(nav.first_item)),
+    #("last_item", json.JInt(nav.last_item))
+  ])
+}
+
+option(value: Option(String)) -> json.Json {
+  match value {
+    Some(url) -> json.JString(url)
+    None -> json.JNull()
+  }
+}

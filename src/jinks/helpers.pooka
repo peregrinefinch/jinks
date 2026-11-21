@@ -1,0 +1,178 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// Templates borrow small, deterministic helpers rather than a filesystem or
+//// a network client. Asset fingerprints are prepared once by the build; a
+//// template cannot turn an asset name into an arbitrary file read.
+module helpers
+
+import jinks/config
+import jinks/filters
+import jinks/boundary
+import jinks/storage
+import jinks/highlight
+import jinks/date
+import jinks/publishing
+import pooka/int
+import pooka/json
+import pooka/list
+import pooka/path
+import pooka/string
+import pooka/uri
+import tuck
+
+install(
+  library: tuck.Library,
+  site: config.Config,
+  clock: String,
+  assets: List(#(String, String))
+) -> Result(tuck.Library, String) {
+  let library = filters.install(library)
+  let library = tuck.with_filter(library, "strip_tags", fn(value, _) {
+    text(value, fn(text) { Ok(json.JString(publishing.plain(text))) })
+  })
+  let library = tuck.with_filter(library, "relative_url", fn(value, _) {
+    text(value, fn(text) {
+      let url = relative(site.base_url, text)?
+      Ok(json.JString(url))
+    })
+  })
+  let library = tuck.with_filter(library, "absolute_url", fn(value, _) {
+    text(value, fn(text) {
+      Ok(json.JString(publishing.absolute(site.base_url, text)))
+    })
+  })
+  let library = tuck.with_filter(library, "asset", fn(value, _) {
+    text(value, fn(name) {
+      match list.key_find(assets, name) {
+        Some(url) -> Ok(json.JString(url))
+        None -> Error("unknown asset: " + name)
+      }
+    })
+  })
+  let library = tuck.with_filter(library, "reading_time", fn(value, _) {
+    text(value, fn(text) { Ok(json.JInt(reading_time(text))) })
+  })
+  let library = tuck.with_filter(library, "long_date", fn(value, _) {
+    text(value, fn(text) {
+      let formatted = format_date(text, False)?
+      Ok(json.JString(formatted))
+    })
+  })
+  let library = tuck.with_filter(library, "short_date", fn(value, _) {
+    text(value, fn(text) {
+      let formatted = format_date(text, True)?
+      Ok(json.JString(formatted))
+    })
+  })
+  match tuck.with_function(library, "time.now", fn(args) {
+    match args {
+      [] -> Ok(json.JString(clock))
+      _ -> Error("time.now expects no arguments")
+    }
+  }) {
+    Ok(library) -> Ok(library)
+    Error(error) -> Error(tuck.describe(error))
+  }
+}
+
+text(value: json.Json, run: fn(String) -> Result(json.Json, String)) -> Result(
+  json.Json,
+  String
+) {
+  match value {
+    json.JString(text) -> run(text)
+    _ -> Error("helper expects a string")
+  }
+}
+
+relative(base: String, url: String) -> Result(String, String) {
+  match string.starts_with(url, "https://") || string.starts_with(
+    url,
+    "http://"
+  ) {
+    True -> Ok(url)
+    False -> {
+      let address = match uri.parse(base) {
+        Ok(address) -> Ok(address)
+        Error(_) -> Error("invalid base-url")
+      }?
+      match string.starts_with(url, "/") && !string.starts_with(url, "//") {
+        True -> Ok(string.remove_suffix(address.path, "/") + url)
+        False -> Error("relative_url expects a site-relative path")
+      }
+    }
+  }
+}
+
+reading_time(source: String) -> Int {
+  let words = publishing.plain(source) |> string.replace("\n", " ") |> string.replace(
+    "\t",
+    " "
+  ) |> string.split(" ") |> list.filter(fn(word) { word != "" }) |> list.length()
+  match words {
+    0 -> 0
+    _ -> minutes(words, 0)
+  }
+}
+
+format_date(source: String, short: Bool) -> Result(String, String) {
+  let day = date.parse(string.slice(source, 0, 10))?
+  let month = date.number(day.month)?
+  let names = [
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December"
+  ]
+  let name = match list.first(list.drop(names, month - 1)) {
+    Some(name) -> name
+    None -> ""
+  }
+  let name = match short {
+    True -> string.slice(name, 0, 3)
+    False -> name
+  }
+  let number = date.number(day.day)?
+  Ok(int.to_string(number) + " " + name + " " + day.year)
+}
+
+minutes(words: Int, total: Int) -> Int {
+  match words <= 0 {
+    True -> total
+    False -> minutes(words - 200, total + 1)
+  }
+}
+
+/// Samples are author-selected source files beneath a dedicated root. No host
+/// function exposes an arbitrary read capability to a template.
+with_samples(library: tuck.Library, root: String) -> Result(
+  tuck.Library,
+  String
+) {
+  match tuck.with_function(library, "sample", fn(args) {
+    let relative = match args {
+      [json.JString(name)] -> Ok(name + ".pooka")
+      [json.JString(name), json.JString(file)] -> Ok(name + "/" + file)
+      _ -> Error("sample expects a sample name and optional relative filename")
+    }?
+    let relative = config.relative(relative)?
+    let _ = boundary.guard(root, "samples/" + relative)?
+    let source = storage.read(path.join([root, "samples", relative]))?
+    Ok(
+      json.JString(
+        highlight.render(string.remove_suffix(source, "\n"), "pooka")
+      )
+    )
+  }) {
+    Ok(library) -> Ok(library)
+    Error(error) -> Error(tuck.describe(error))
+  }
+}

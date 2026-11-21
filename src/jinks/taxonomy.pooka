@@ -1,0 +1,205 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// A tag gathers visible pages without inventing another source document.
+//// Display names remain readable; their Unicode slugs are checked for clashes
+//// instead of allowing the last spelling to overwrite the first. Page links
+//// contain no page lists, keeping the resulting JSON graph finite.
+module taxonomy
+
+import jinks/collection
+import jinks/names
+import jinks/content
+import jinks/listing_options
+import jinks/route
+import jinks/value
+import pooka/json
+import pooka/dict
+import pooka/list
+import pooka/string
+
+class Tag(name: String, slug: String, output: String, pages: List(content.Page))
+
+class Index(
+  groups: List(Tag),
+  context: json.Json,
+  by_label: dict.Dict(String, Tag),
+  labels_by_page: dict.Dict(String, List(String))
+)
+
+class _Gather(groups: dict.Dict(String, Tag), slugs: dict.Dict(String, String))
+
+external _Text from erlang "jinks_text" {
+  normalize(text: String) -> String
+
+  slug(text: String) -> String
+}
+
+normalize(label: String) -> Result(String, String) {
+  let name = _Text.normalize(label)
+  match name != "" && !list.any(string.to_list(label), fn(c) {
+    c < 32 || c == 127
+  }) {
+    True -> Ok(name)
+    False -> Error(
+      "tag names must be nonempty and contain no control characters"
+    )
+  }
+}
+
+slug(label: String) -> Result(String, String) {
+  let name = normalize(label)?
+  let chosen = _Text.slug(name)
+  match route.checked(chosen) {
+    Ok(_) -> Ok(chosen)
+    Error(_) -> Error("tag has no portable slug: " + name)
+  }
+}
+
+prepare(
+  options: listing_options.Tags,
+  catalog: collection.Catalog,
+  pages: List(content.Page)
+) -> Result(Index, String) {
+  let selected = match options.enabled {
+    False -> []
+    True -> match options.collection {
+      "" -> list.sort_by(pages, fn(left, right) {
+        string.compare(left.name, right.name)
+      })
+      chosen -> match list.key_find(catalog.groups, chosen) {
+        Some(group) -> group
+        None -> []
+      }
+    }
+  }
+  let gathered = list.try_fold(
+    selected,
+    _Gather(dict.empty(), dict.empty()),
+    fn(found, page) {
+      let labels = list.unique(list.try_map(page.tags, normalize)?)
+      list.try_fold(labels, found, fn(found: _Gather, name) {
+        let chosen = slug(name)?
+        let _ = match found.slugs.get(chosen) {
+          Some(previous) if previous != name -> Error(
+            page.name + ": tag slug collision for " + json.encode(
+              json.JString(chosen)
+            ) + ": " + json.encode(json.JString(previous)) + " and " + json.encode(
+              json.JString(name)
+            )
+          )
+          _ -> Ok(Nil)
+        }?
+        let output = names.canonical(
+          options.path + "/" + chosen + "/index.html"
+        )
+        let _ = route.checked(output)?
+        let previous = match found.groups.get(name) {
+          Some(tag) -> tag.pages
+          None -> []
+        }
+        Ok(
+          _Gather(
+            found.groups.insert(
+              name,
+              Tag(name, chosen, output, [page, ..previous])
+            ),
+            found.slugs.insert(chosen, name)
+          )
+        )
+      })
+    }
+  )?
+  let groups = list.map(gathered.groups.to_list(), fn(entry) {
+    let tag = entry.1
+    Tag(tag.name, tag.slug, tag.output, list.reverse(tag.pages))
+  })
+  let groups = list.sort_by(groups, fn(left, right) {
+    string.compare(left.slug, right.slug)
+  })
+  let by_label = dict.from_list(list.map(groups, fn(tag) { #(tag.name, tag) }))
+  let labels_by_page = dict.from_list(list.map(selected, fn(page) {
+    #(page.name, list.unique(list.map(page.tags, _Text.normalize)))
+  }))
+  let partial = Index(groups, json.JObject([]), by_label, labels_by_page)
+  Ok(
+    Index(
+      groups,
+      json.JObject(
+        [
+          #(
+            "tags",
+            json.JArray(list.map(groups, fn(tag) { summary(partial, tag) }))
+          )
+        ]
+      ),
+      by_label,
+      labels_by_page
+    )
+  )
+}
+
+link(tag: Tag) -> json.Json {
+  json.JObject(
+    [
+      #("name", json.JString(tag.name)),
+      #("slug", json.JString(tag.slug)),
+      #("url", json.JString(route.url(tag.output))),
+      #("count", json.JInt(list.length(tag.pages)))
+    ]
+  )
+}
+
+links(page: content.Page, index: Index) -> json.Json {
+  let labels = index.labels_by_page.get_or(page.name, [])
+  json.JArray(list.filter_map(labels, fn(name) {
+    match index.by_label.get(name) {
+      None -> None
+      Some(tag) -> Some(link(tag))
+    }
+  }))
+}
+
+page_summary(index: Index, page: content.Page) -> json.Json {
+  value.merge(
+    collection.summary(page),
+    json.JObject([#("tag_links", links(page, index))])
+  )
+}
+
+summary(index: Index, tag: Tag) -> json.Json {
+  value.merge(
+    link(tag),
+    json.JObject(
+      [
+        #(
+          "pages",
+          json.JArray(
+            list.map(tag.pages, fn(page) { page_summary(index, page) })
+          )
+        )
+      ]
+    )
+  )
+}
+
+collections(
+  index: Index,
+  catalog: collection.Catalog,
+  pages: List(content.Page)
+) -> json.Json {
+  let all = list.sort_by(pages, fn(left, right) {
+    string.compare(left.name, right.name)
+  })
+  let entries = list.map(catalog.groups, fn(group) {
+    #(
+      group.0,
+      json.JArray(list.map(group.1, fn(page) { page_summary(index, page) }))
+    )
+  })
+  json.JObject([
+    #("all", json.JArray(list.map(all, fn(page) {
+      page_summary(index, page)
+    }))),
+    ..entries
+  ])
+}

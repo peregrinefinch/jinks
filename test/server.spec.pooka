@@ -1,0 +1,260 @@
+// SPDX-License-Identifier: Apache-2.0
+module server_test
+
+import jinks/build
+import jinks/config
+import jinks/scaffold
+import jinks/serve
+import jinks/server
+import jinks/storage
+import poke/should
+import pooka/file
+import pooka/http
+import pooka/httpc
+import pooka/int
+import pooka/path
+import pooka/process
+import pooka/string
+
+site(name: String) -> String {
+  let root = "build/jinks-server/" + int.to_string(process.pid()) + "/" + name
+  let _ = should.be_ok(scaffold.create(root))
+  let _ = should.be_ok(build.run(root))
+  root
+}
+
+url(running: server.Running, suffix: String) -> String {
+  "http://127.0.0.1:" + int.to_string(running.port) + suffix
+}
+
+with_server(name: String, live: Bool, work: fn(String, server.Running) -> Nil) {
+  let root = site(name)
+  let running = should.be_ok(
+    server.start(path.join([root, "public"]), "127.0.0.1", 0, live)
+  )
+  let result = should.attempt(fn() { work(root, running) })
+  let _ = should.be_ok(server.stop(running))
+  let _ = should.be_ok(result)
+  Nil
+}
+
+test "request paths reject traversal, hidden files, invalid escapes and backslashes" {
+  loop target in [
+    "/../config.toml",
+    "/%2e%2e/config.toml",
+    "/.jinks-manifest.json",
+    "/%2egit/config",
+    "/a%5cb",
+    "/%00",
+    "/%09",
+    "/%7f",
+    "/%GG",
+    "http://example.com/",
+    "/C:/file"
+  ] {
+    let _ = should.be_error(server.relative(target))
+  }
+  should.equal(server.relative("/notes/owl/?hello=world"), Ok("notes/owl"))
+  should.equal(server.relative("/caf%C3%A9/"), Ok("café"))
+}
+
+test "MIME types and unknown binary types are explicit" {
+  should.equal(server.mime("app.CSS"), "text/css; charset=utf-8")
+  should.equal(server.mime("icon.svg"), "image/svg+xml")
+  should.equal(server.mime("font.woff2"), "font/woff2")
+  should.equal(server.mime("site.webmanifest"), "application/manifest+json")
+  should.equal(server.mime("module.mjs"), "text/javascript; charset=utf-8")
+  should.equal(server.mime("unknown.bin"), "application/octet-stream")
+}
+
+test "actual GET and HEAD return the same length and HEAD has no body" {
+  with_server("head", False, fn(_, running) {
+    let get = should.be_ok(httpc.get(url(running, "/")))
+    should.equal(get.status, 200)
+    should.equal(get.header("content-type"), Some("text/html; charset=utf-8"))
+    let request = should.be_ok(http.get(url(running, "/"))).with_method(
+      http.Head()
+    )
+    let head = should.be_ok(httpc.send(request))
+    should.equal(head.status, 200)
+    should.equal(head.body, <<>>)
+    should.equal(head.header("content-length"), get.header("content-length"))
+    should.equal(head.header("cache-control"), Some("no-store"))
+    should.equal(head.header("x-content-type-options"), Some("nosniff"))
+  })
+}
+
+test "static binary assets and directory index pages are served byte for byte" {
+  with_server("assets", False, fn(root, running) {
+    let _ = should.be_ok(
+      storage.write(path.join([root, "content/owl.md"]), "# Owl")
+    )
+    let bytes = <<0, 255, 128, 10>>
+    let _ = should.be_ok(
+      file.write_bytes(path.join([root, "public/icon.bin"]), bytes)
+    )
+    let _ = should.be_ok(build.run(root))
+    should.equal(should.be_ok(httpc.get(url(running, "/icon.bin"))).body, bytes)
+    let reply = should.be_ok(httpc.get(url(running, "/owl/?a=b")))
+    should.equal(reply.status, 200)
+    should.be_true(
+      string.contains(should.be_ok(reply.text()), "<h1 id=\"owl\">Owl</h1>")
+    )
+  })
+}
+
+test "missing pages use a custom 404 and unsupported methods return Allow" {
+  with_server("not-found", False, fn(root, running) {
+    let _ = should.be_ok(
+      storage.write(path.join([root, "public/404.html"]), "<h1>Lost owl</h1>")
+    )
+    let missing = should.be_ok(httpc.get(url(running, "/missing")))
+    should.equal(missing.status, 404)
+    should.equal(should.be_ok(missing.text()), "<h1>Lost owl</h1>")
+    let post = should.be_ok(http.post(url(running, "/")))
+    let reply = should.be_ok(httpc.send(post))
+    should.equal(reply.status, 405)
+    should.equal(reply.header("allow"), Some("GET, HEAD"))
+  })
+}
+
+test "reload code is added to HTTP HTML but never saved in production files" {
+  with_server("reload", True, fn(root, running) {
+    let reply = should.be_ok(httpc.get(url(running, "/")))
+    should.be_true(
+      string.contains(should.be_ok(reply.text()), "/__jinks/client.js")
+    )
+    let original = should.be_ok(
+      storage.read(path.join([root, "public/index.html"]))
+    )
+    should.be_false(string.contains(original, "/__jinks/"))
+    let client = should.be_ok(httpc.get(url(running, "/__jinks/client.js")))
+    should.equal(client.status, 200)
+    should.be_true(string.contains(should.be_ok(client.text()), "EventSource"))
+    should.be_true(string.contains(should.be_ok(client.text()), "textContent"))
+  })
+}
+
+test "no-reload does not inject a client or expose reload status" {
+  with_server("no-reload", False, fn(_, running) {
+    let reply = should.be_ok(httpc.get(url(running, "/")))
+    should.be_false(string.contains(should.be_ok(reply.text()), "/__jinks/"))
+    should.equal(
+      should.be_ok(httpc.get(url(running, "/__jinks/client.js"))).status,
+      404
+    )
+    should.equal(
+      should.be_ok(httpc.get(url(running, "/__jinks/status"))).status,
+      404
+    )
+  })
+}
+
+test "server stop releases the port and a conflicting listener fails" {
+  let root = site("ports")
+  let running = should.be_ok(
+    server.start(path.join([root, "public"]), "127.0.0.1", 0, False)
+  )
+  let result = should.attempt(fn() {
+    let _ = should.be_error(
+      server.start(
+        path.join([root, "public"]),
+        "127.0.0.1",
+        running.port,
+        False
+      )
+    )
+    Nil
+  })
+  let _ = should.be_ok(server.stop(running))
+  let _ = should.be_ok(result)
+  should.be_false(server.alive(running))
+  let reopened = should.be_ok(
+    server.start(path.join([root, "public"]), "127.0.0.1", running.port, False)
+  )
+  let _ = should.be_ok(server.stop(reopened))
+}
+
+test "listener settings are typed, loopback only, and CLI overrides TOML" {
+  let root = site("options")
+  let _ = should.be_ok(
+    storage.write(
+      path.join([root, "config.toml"]),
+      "[server]\nport = 4321\nhost = \"localhost\"\nlive-reload = true\n"
+    )
+  )
+  let options = should.be_ok(serve.parse([root, "--port", "0", "--no-reload"]))
+  should.equal(options.port, 0)
+  should.equal(options.host, "127.0.0.1")
+  should.be_false(options.live)
+  let _ = should.be_error(serve.parse([root, "--port", "oops"]))
+  let _ = should.be_error(serve.parse([root, "--host", "0.0.0.0"]))
+  let _ = should.be_error(serve.parse([root, "--typo"]))
+  loop source in [
+    "[server]\nport = -1",
+    "[server]\nport = 65536",
+    "[server]\nport = \"four\"",
+    "[server]\nlive-reload = 1",
+    "[server]\nhost = \"0.0.0.0\"",
+    "server = false",
+    "[server]\ntypo = true"
+  ] {
+    let _ = should.be_error(config.parse(source))
+  }
+}
+
+test "served HTML carries the revision needed to catch an initial SSE race" {
+  with_server("revision-stamp", True, fn(_, running) {
+    let _ = should.be_ok(server.notify(running, 7, ""))
+    let page = should.be_ok(httpc.get(url(running, "/")))
+    should.be_true(
+      string.contains(should.be_ok(page.text()), "data-jinks-revision=\"7\"")
+    )
+    let client = should.be_ok(httpc.get(url(running, "/__jinks/client.js")))
+    should.be_true(
+      string.contains(should.be_ok(client.text()), "data-jinks-revision")
+    )
+  })
+}
+
+test "base-path mounts are Unicode aware and end at path boundaries" {
+  should.equal(
+    server.mount("https://example.org/caf%C3%A9/notes/"),
+    Ok("café/notes")
+  )
+  should.equal(server.mount_url("café/notes"), "/caf%C3%A9/notes/")
+  should.equal(server.unmount("blog/post", "blog"), Some("post"))
+  should.equal(server.unmount("blog", "blog"), Some(""))
+  should.equal(server.unmount("blogger/post", "blog"), None)
+  should.be_error(server.mount("https://example.org/%2e%2e/"))
+}
+
+test "prefixed previews serve only their mount and decode request paths once" {
+  let root = site("prefixed")
+  let _ = should.be_ok(
+    storage.write(path.join([root, "public/100%2e.txt"]), "literal percent")
+  )
+  let running = should.be_ok(
+    server.start_site(
+      path.join([root, "public"]),
+      "127.0.0.1",
+      0,
+      True,
+      "https://example.org/blog/"
+    )
+  )
+  let result = should.attempt(fn() {
+    should.equal(should.be_ok(httpc.get(url(running, "/blog/"))).status, 200)
+    should.equal(should.be_ok(httpc.get(url(running, "/"))).status, 404)
+    should.equal(should.be_ok(httpc.get(url(running, "/blogger/"))).status, 404)
+    let literal = should.be_ok(httpc.get(url(running, "/blog/100%252e.txt")))
+    should.equal(literal.status, 200)
+    should.equal(should.be_ok(literal.text()), "literal percent")
+    should.equal(
+      should.be_ok(httpc.get(url(running, "/__jinks/client.js"))).status,
+      200
+    )
+  })
+  let _ = should.be_ok(server.stop(running))
+  let _ = should.be_ok(result)
+}

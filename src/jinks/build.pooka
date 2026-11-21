@@ -1,0 +1,310 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// Discover and render everything before writing a page. A broken template
+//// should not replace yesterday's readable work with half of today's work.
+//// An owned-file manifest and staged publication carry the previous site
+//// through write failures while removing only stale generated files.
+module build
+
+import jinks/config
+import jinks/links
+import jinks/provider
+import jinks/publishing
+import jinks/helpers
+import pooka/hash
+import pooka/int
+import jinks/taxonomy
+import jinks/generated
+import pooka/json
+import jinks/request
+import jinks/redirect
+import jinks/date
+import jinks/route
+import pooka/order.{Order}
+import jinks/collection
+import jinks/section
+import jinks/data
+import jinks/boundary
+import jinks/publish
+import jinks/content
+import jinks/storage
+import jinks/template
+import jinks/theme
+import pooka/file
+import pooka/list
+import pooka/path
+import pooka/string
+import tuck
+
+class Output(name: String, text: String)
+
+class Asset(name: String, source: String)
+
+prepare(root: String) -> Result(#(config.Config, List(Output)), String) {
+  prepare_selected(request.defaults(root))
+}
+
+/// The build observes one UTC publication day. Tests can supply that day
+/// without borrowing the wall clock or changing process-wide state.
+prepare_at(root: String, today: String) -> Result(
+  #(config.Config, List(Output)),
+  String
+) {
+  prepare_request(request.defaults(root), today)
+}
+
+prepare_selected(selected: request.Request) -> Result(
+  #(config.Config, List(Output)),
+  String
+) {
+  prepare_timed(selected, date.timestamp())
+}
+
+prepare_request(selected: request.Request, today: String) -> Result(
+  #(config.Config, List(Output)),
+  String
+) {
+  let _ = date.parse(today)?
+  prepare_timed(selected, today + "T00:00:00Z")
+}
+
+prepare_timed(selected: request.Request, clock: String) -> Result(
+  #(config.Config, List(Output)),
+  String
+) {
+  let _ = date.validate_timestamp(clock)?
+  let today = string.slice(clock, 0, 10)
+  let _ = date.parse(today)?
+  let root = selected.root
+  let settings = request.load(selected)?
+  let _ = list.try_fold(
+    ["content", "themes", "layouts", "static", "data", "samples"],
+    Nil,
+    fn(_, name) {
+      let _ = boundary.guard(root, name)?
+      boundary.tree(path.join([root, name]))
+    }
+  )?
+  let theme_root = path.join([root, "themes", settings.theme])
+  let appearance = theme.parse(
+    storage.read(path.join([theme_root, "theme.toml"]))?
+  )?
+  let settings = theme.apply(settings, appearance)
+  let local_data = provider.run(
+    selected.providers,
+    provider.Context(root, clock),
+    data.load(root)?
+  )?
+  let library = match tuck.load(path.join([theme_root, "layouts"])) {
+    Ok(value) -> Ok(value)
+    Error(e) -> Error(tuck.describe(e))
+  }?
+  let library = match file.is_directory(path.join([root, "layouts"])) {
+    Ok(True) -> {
+      let names = storage.files(path.join([root, "layouts"]), "")?
+      list.try_fold(names, library, fn(lib, name) {
+        match string.ends_with(name, ".tuck") {
+          True -> match tuck.add(
+            lib,
+            name,
+            storage.read(path.join([root, "layouts", name]))?
+          ) {
+            Ok(value) -> Ok(value)
+            Error(e) -> Error(tuck.describe(e))
+          }
+          False -> Ok(lib)
+        }
+      })
+    }
+    Ok(False) -> Ok(library)
+    Error(e) -> Error(e.message)
+  }?
+  let asset_index = list.try_map(assets(root, settings)?, fn(asset) {
+    let bytes = match file.read_bytes(asset.source) {
+      Ok(bytes) -> Ok(bytes)
+      Error(error) -> Error(error.message)
+    }?
+    let name = route.url(asset.name)
+    let url = helpers.relative(settings.base_url, name)?
+    Ok(#(name, url + "?v=" + fingerprint(hash.sha256(bytes), [])))
+  })?
+  let library = helpers.install(library, settings, clock, asset_index)?
+  let library = helpers.with_samples(library, root)?
+  let names = storage.files(path.join([root, "content"]), "")?
+  let source_pages = list.try_fold(names, [], fn(found, name) {
+    match string.ends_with(string.lowercase(name), ".md") || string.ends_with(
+      string.lowercase(name),
+      ".tuck"
+    ) {
+      False -> Ok(found)
+      True -> {
+        let page = content.parse_with_policy(
+          name,
+          storage.read(path.join([root, "content", name]))?,
+          section.find(settings.collections, name),
+          settings.raw_html
+        )?
+        let future = match page.published {
+          None -> False
+          Some(day) -> string.compare(day, today) == Order.Greater
+        }
+        match (!page.draft || settings.build.drafts) && (
+          !future || settings.build.future
+        ) {
+          False -> Ok(found)
+          True -> {
+            let _ = match list.any(found, fn(previous: content.Page) {
+              publish.conflicts(previous.output, page.output)
+            }) {
+              True -> Error(
+                "two pages share an output: " + route.url(page.output)
+              )
+              False -> Ok(Nil)
+            }?
+            Ok(list.append(found, page))
+          }
+        }
+      }
+    }
+  })?
+  let catalog = collection.prepare(settings.collections, source_pages)?
+  let tags = taxonomy.prepare(settings.listings.tags, catalog, source_pages)?
+  let collections = taxonomy.collections(tags, catalog, source_pages)
+  let jobs = generated.prepare(settings, catalog, tags, local_data, collections)?
+  let alias_names = list.flat_map(source_pages, fn(page) { page.aliases })
+  let targets = list.concat(
+    list.map(source_pages, fn(page) { page.output }),
+    list.concat(alias_names, list.map(jobs, fn(job) { job.output }))
+  )
+  let targets = list.concat(targets, publishing.names(settings))
+  let selected_assets = assets(root, settings)?
+  let _ = publish.validate(
+    list.concat(targets, list.map(selected_assets, fn(asset) { asset.name }))
+  )?
+  let pages = list.try_map(source_pages, fn(page) {
+    let context = collection.context_with(page, catalog, fn(member) {
+      taxonomy.page_summary(tags, member)
+    })
+    let rendered = template.render_context(
+      library,
+      settings,
+      page,
+      context,
+      local_data,
+      collections,
+      json.JObject([#("taxonomies", tags.context)])
+    )?
+    Ok(Output(page.output, rendered))
+  })?
+  let exports = publishing.prepare(
+    settings,
+    source_pages,
+    list.concat(
+      list.map(source_pages, fn(page) { page.output }),
+      list.map(jobs, fn(job) { job.output })
+    ),
+    clock,
+    list.map(pages, fn(page) { #(page.name, page.text) })
+  )?
+  let prefix = helpers.relative(settings.base_url, "/")? |> string.remove_suffix(
+    "/"
+  )
+  let aliases = list.flat_map(source_pages, fn(page) {
+    list.map(page.aliases, fn(alias) {
+      Output(alias, redirect.render_url(prefix + route.url(page.output)))
+    })
+  })
+  let extra = list.try_map(jobs, fn(job) {
+    let rendered = template.render_layout(library, job.layout, job.context)?
+    Ok(Output(job.output, rendered))
+  })?
+  let pages = list.concat(
+    pages,
+    list.concat(
+      aliases,
+      list.concat(
+        extra,
+        list.map(exports, fn(output) { Output(output.0, output.1) })
+      )
+    )
+  )
+  Ok(#(settings, pages))
+}
+
+run(root: String) -> Result(Int, String) {
+  let #(_, count) = run_report(root)?
+  Ok(count)
+}
+
+/// Return the settings used by this publication so a watcher never guesses
+/// the output directory from a second, potentially newer configuration read.
+run_report(root: String) -> Result(#(config.Config, Int), String) {
+  run_selected(request.defaults(root))
+}
+
+run_selected(selected: request.Request) -> Result(#(config.Config, Int), String) {
+  let root = selected.root
+  let #(settings, pages) = prepare_selected(selected)?
+  let selected = assets(root, settings)?
+  let _ = publish.run(
+    root,
+    settings.output,
+    list.map(pages, fn(page) { #(page.name, page.text) }),
+    list.map(selected, fn(asset) { #(asset.name, asset.source) })
+  )?
+  Ok(#(settings, list.length(pages)))
+}
+
+/// Site assets replace theme assets by relative path, preserving binary bytes.
+assets(root: String, settings: config.Config) -> Result(List(Asset), String) {
+  let themed = asset_files(
+    path.join([root, "themes", settings.theme, "static"])
+  )?
+  let local = asset_files(path.join([root, "static"]))?
+  Ok(list.concat(
+    list.filter(themed, fn(asset: Asset) {
+      !list.any(local, fn(replacement: Asset) {
+        replacement.name == asset.name
+      })
+    }),
+    local
+  ))
+}
+
+asset_files(root: String) -> Result(List(Asset), String) {
+  match file.is_directory(root) {
+    Ok(False) -> Ok([])
+    Error(e) -> Error(e.message)
+    Ok(True) -> {
+      let names = storage.files(root, "")?
+      Ok(list.map(names, fn(name) { Asset(name, path.join([root, name])) }))
+    }
+  }
+}
+
+fingerprint(bytes: BitArray, done: List(String)) -> String {
+  match bytes {
+    <<byte, rest:bytes>> -> {
+      let hex = match int.to_base(byte, 16) {
+        Ok(hex) -> string.pad_start(hex, 2, "0")
+        Error(_) -> "00"
+      }
+      fingerprint(rest, [hex, ..done])
+    }
+    _ -> string.slice(list.reverse(done) |> string.join(""), 0, 12)
+  }
+}
+
+check_selected(selected: request.Request) -> Result(Nil, String) {
+  let #(site, pages) = prepare_selected(selected)?
+  let asset_names = list.map(assets(selected.root, site)?, fn(asset) {
+    asset.name
+  })
+  links.check(
+    site.base_url,
+    list.map(pages, fn(page) {
+      #(page.name, page.text)
+    }),
+    asset_names
+  )
+}

@@ -1,0 +1,280 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// Read a page's envelope before dressing it for the browser. Collection
+//// defaults are a first layer; explicitly written metadata wins, including
+//// nested parameters. The Markdown body never passes through Tuck's parser.
+module content
+
+import jinks/markdown
+import marksy/frontmatter
+import jinks/config
+import jinks/date
+import jinks/route
+import jinks/section
+import jinks/value
+import pooka/int
+import pooka/json
+import pooka/list
+import pooka/path
+import pooka/string
+import pooka/uri
+import tome
+
+enum Kind {
+  Markdown
+  Template
+}
+
+class Page(
+  title: String,
+  output: String,
+  layout: String,
+  body: String,
+  draft: Bool,
+  params: json.Json,
+  name: String,
+  collection: String,
+  published: Option(String),
+  order: Int,
+  tags: List(String),
+  slug: String,
+  metadata: json.Json,
+  kind: Kind,
+  body_line: Int,
+  aliases: List(String)
+)
+
+parse(name: String, source: String) -> Result(Page, String) {
+  parse_with(name, source, None)
+}
+
+/// Explicit page metadata overrides defaults without discarding sibling params.
+parse_with(name: String, source: String, shelf: Option(section.Spec)) -> Result(
+  Page,
+  String
+) {
+  parse_with_policy(name, source, shelf, False)
+}
+
+parse_with_policy(
+  name: String,
+  source: String,
+  shelf: Option(section.Spec),
+  raw_html: Bool
+) -> Result(Page, String) {
+  match _parse(name, source, shelf, raw_html) {
+    Ok(page) -> Ok(page)
+    Error(error) -> Error(match string.starts_with(error, name + ":") {
+      True -> error
+      False -> name + ": " + error
+    })
+  }
+}
+
+_parse(
+  name: String,
+  source: String,
+  shelf: Option(section.Spec),
+  raw_html: Bool
+) -> Result(Page, String) {
+  let parsed = match frontmatter.read(source) {
+    Ok(page) -> Ok(page)
+    Error(e) -> Error(name + ":" + int.to_string(e.line) + ": " + e.message)
+  }?
+  let written = match parsed.metadata {
+    Some(data) -> data
+    None -> tome.TTable([])
+  }
+  let defaults = match shelf {
+    Some(spec) -> spec.defaults
+    None -> tome.TTable([])
+  }
+  let metadata = value.merge_toml(defaults, written)
+  let kind = match string.ends_with(string.lowercase(name), ".tuck") {
+    True -> Kind.Template
+    False -> Kind.Markdown
+  }
+  let default_layout = match kind {
+    Kind.Template -> ""
+    Kind.Markdown -> "page.html.tuck"
+  }
+  let title = config.text(metadata, "title", name)?
+  let layout = config.text(metadata, "layout", default_layout)?
+  let layout = match layout == "" || string.ends_with(
+    string.lowercase(layout),
+    ".tuck"
+  ) {
+    True -> layout
+    False -> layout + ".html.tuck"
+  }
+  let _ = match layout {
+    "" -> Ok("")
+    _ -> config.relative(layout)
+  }?
+  let draft = match tome.get(metadata, "draft") {
+    None -> Ok(False)
+    Some(tome.TBool(value)) -> Ok(value)
+    _ -> Error(name + ": draft must be a Boolean")
+  }?
+  let published = match tome.get(metadata, "date") {
+    None -> Ok(None)
+    Some(tome.TDate(value)) -> {
+      let _ = date.parse(value)?
+      Ok(Some(value))
+    }
+    Some(tome.TString(value)) -> {
+      let _ = date.parse(value)?
+      Ok(Some(value))
+    }
+    _ -> Error(name + ": date must be a YYYY-MM-DD publication day")
+  }?
+  let order = match tome.get(metadata, "order") {
+    None -> Ok(0)
+    Some(tome.TInt(n)) -> Ok(n)
+    _ -> Error(name + ": order must be an integer")
+  }?
+  let tags = match tome.get(metadata, "tags") {
+    None -> Ok([])
+    Some(tome.TArray(values)) -> list.try_map(values, fn(tag) {
+      match tag {
+        tome.TString(v) -> Ok(v)
+        _ -> Error(name + ": tags must contain strings")
+      }
+    })
+    _ -> Error(name + ": tags must be an array")
+  }?
+  let collection = match shelf {
+    Some(spec) -> spec.name
+    None -> ""
+  }
+  let base_name = match kind {
+    Kind.Template -> string.drop_end(name, 5)
+    Kind.Markdown -> name
+  }
+  let default_slug = match path.extension(base_name) {
+    None -> path.basename(base_name)
+    Some(_) -> path.stem(base_name)
+  }
+  let slug = config.text(metadata, "slug", default_slug)?
+  let _ = route.checked(slug)?
+  let _ = match string.contains(slug, "/") {
+    True -> Error("slug must be one path segment")
+    False -> Ok(Nil)
+  }?
+  let pattern = match shelf {
+    Some(spec) -> spec.permalink
+    None -> ""
+  }
+  let pattern = config.text(metadata, "permalink", pattern)?
+  let output = match pattern {
+    "" -> match tome.get(metadata, "slug") {
+      None -> match kind {
+        Kind.Template -> route.template_output(name)
+        Kind.Markdown -> route.output(name)
+      }
+      Some(_) -> {
+        let parent = path.dirname(name)
+        let file = match parent {
+          "." -> slug + ".md"
+          _ -> parent + "/" + slug + ".md"
+        }
+        match #(kind, path.extension(base_name)) {
+          #(Kind.Template, Some(extension)) -> {
+            let named = slug + extension + ".tuck"
+            route.template_output(match parent {
+              "." -> named
+              _ -> parent + "/" + named
+            })
+          }
+          _ -> route.output(file)
+        }
+      }
+    }
+    _ -> {
+      let pattern = string.replace(
+        string.replace(pattern, ":slug", slug),
+        ":section",
+        collection
+      )
+      let pattern = match published {
+        None -> pattern
+        Some(value) -> {
+          let day = date.parse(value)?
+          string.replace(
+            string.replace(
+              string.replace(pattern, ":year", day.year),
+              ":month",
+              day.month
+            ),
+            ":day",
+            day.day
+          )
+        }
+      }
+      let _ = match string.starts_with(pattern, "/") && string.contains(
+        pattern,
+        ":"
+      ) {
+        True -> Error(
+          name + ": unresolved permalink placeholder; date parts require a publication date"
+        )
+        False -> Ok(Nil)
+      }?
+      route.permalink(pattern)
+    }
+  }?
+  let aliases = match tome.get(metadata, "aliases") {
+    None -> Ok([])
+    Some(tome.TArray(items)) -> list.try_map(items, fn(item) {
+      let url = match item {
+        tome.TString(url) -> Ok(url)
+        _ -> Error(name + ": aliases must contain URL strings")
+      }?
+      let destination = route.permalink(url)?
+      match string.ends_with(string.lowercase(destination), ".html") && destination != output {
+        True -> Ok(destination)
+        False -> Error(
+          name + ": aliases must name distinct HTML pages, not the canonical output"
+        )
+      }
+    })
+    _ -> Error(name + ": aliases must be an array")
+  }?
+  let #(body, outline) = match kind {
+    Kind.Markdown -> markdown.author(parsed.body, raw_html)
+    Kind.Template -> #(parsed.body, json.JArray([]))
+  }
+  let _ = match tome.get(metadata, "feed_id") {
+    None -> Ok(Nil)
+    Some(tome.TString(identifier)) -> match uri.parse(identifier) {
+      Ok(address) if address.scheme != None -> Ok(Nil)
+      _ -> Error("feed_id must be an absolute feed identifier")
+    }
+    _ -> Error("feed_id must be a string")
+  }?
+  let params = value.params(metadata)?
+  let metadata = value.merge(
+    value.to_json(metadata)?,
+    json.JObject([#("outline", outline)])
+  )
+  Ok(
+    Page(
+      title,
+      output,
+      layout,
+      body,
+      draft,
+      params,
+      name,
+      collection,
+      published,
+      order,
+      list.unique(tags),
+      slug,
+      metadata,
+      kind,
+      parsed.body_line,
+      list.unique(aliases)
+    )
+  )
+}

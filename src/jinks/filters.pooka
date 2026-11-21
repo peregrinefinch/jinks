@@ -1,0 +1,200 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// Collection helpers work on the already prepared template values. They do
+//// not discover files or reshuffle a catalog behind the author's back.
+module filters
+
+import marksy/html
+import jinks/highlight
+import jinks/date
+import pooka/int
+import pooka/json
+import pooka/list
+import pooka/order.{Order}
+import pooka/string
+import tuck
+
+install(library: tuck.Library) -> tuck.Library {
+  let library = tuck.with_filter(library, "json_script", json_script)
+  let library = tuck.with_filter(library, "date", format_date)
+  let library = tuck.with_filter(library, "where", where)
+  let library = tuck.with_filter(library, "distinct", distinct)
+  let library = tuck.with_filter(library, "concat", concat)
+  let library = tuck.with_filter(library, "sort_by", sort_by)
+  let library = tuck.with_filter(library, "group_by", group_by)
+  let library = tuck.with_filter(library, "split", split)
+  let library = tuck.with_filter(library, "starts_with", starts_with)
+  let library = tuck.with_filter(library, "inline_code", inline_code)
+  tuck.with_filter(library, "terminal", terminal)
+}
+
+field(value: json.Json, key: String) -> json.Json {
+  match json.get(value, key) {
+    Some(value) -> value
+    None -> json.JNull()
+  }
+}
+
+where(value: json.Json, args: List(json.Json)) -> Result(json.Json, String) {
+  match #(value, args) {
+    #(json.JArray(items), [json.JString(key), expected]) -> Ok(
+      json.JArray(list.filter(items, fn(item) { field(item, key) == expected }))
+    )
+    _ -> Error("where expects an array, field name and matching value")
+  }
+}
+
+distinct(value: json.Json, args: List(json.Json)) -> Result(json.Json, String) {
+  match #(value, args) {
+    #(json.JArray(items), [json.JString(key)]) -> Ok(
+      json.JArray(list.unique(list.map(items, fn(item) { field(item, key) })))
+    )
+    _ -> Error("distinct expects an array and field name")
+  }
+}
+
+concat(value: json.Json, args: List(json.Json)) -> Result(json.Json, String) {
+  match #(value, args) {
+    #(json.JArray(left), [json.JArray(right)]) -> Ok(
+      json.JArray(list.concat(left, right))
+    )
+    _ -> Error("concat expects two arrays")
+  }
+}
+
+sort_by(value: json.Json, args: List(json.Json)) -> Result(json.Json, String) {
+  match #(value, args) {
+    #(json.JArray(items), [json.JString(key)]) -> Ok(
+      json.JArray(
+        list.sort_by(items, fn(left, right) {
+          compare(field(left, key), field(right, key))
+        })
+      )
+    )
+    _ -> Error("sort_by expects an array and field name")
+  }
+}
+
+compare(left: json.Json, right: json.Json) -> Order {
+  match #(left, right) {
+    #(json.JInt(a), json.JInt(b)) -> int.compare(a, b)
+    #(json.JNull(), json.JNull()) -> Order.Equal
+    #(json.JNull(), _) -> Order.Greater
+    #(_, json.JNull()) -> Order.Less
+    #(json.JString(a), json.JString(b)) -> string.compare(a, b)
+    _ -> string.compare(json.encode(left), json.encode(right))
+  }
+}
+
+group_by(value: json.Json, args: List(json.Json)) -> Result(json.Json, String) {
+  match #(value, args) {
+    #(json.JArray(items), [json.JString(key)]) -> {
+      let names = list.unique(list.map(items, fn(item) { field(item, key) }))
+      Ok(json.JArray(list.map(names, fn(name) {
+        json.JObject(
+          [
+            #("name", name),
+            #(
+              "entries",
+              json.JArray(
+                list.filter(items, fn(item) { field(item, key) == name })
+              )
+            )
+          ]
+        )
+      })))
+    }
+    _ -> Error("group_by expects an array and field name")
+  }
+}
+
+split(value: json.Json, args: List(json.Json)) -> Result(json.Json, String) {
+  match #(value, args) {
+    #(json.JString(text), [json.JString(separator)]) -> Ok(
+      json.JArray(list.map(string.split(text, separator), json.JString))
+    )
+    _ -> Error("split expects text and a separator")
+  }
+}
+
+starts_with(value: json.Json, args: List(json.Json)) -> Result(
+  json.Json,
+  String
+) {
+  match #(value, args) {
+    #(json.JString(text), [json.JString(prefix)]) -> Ok(
+      json.JBool(string.starts_with(text, prefix))
+    )
+    _ -> Error("starts_with expects text and a prefix")
+  }
+}
+
+inline_code(value: json.Json, args: List(json.Json)) -> Result(
+  json.Json,
+  String
+) {
+  match #(value, args) {
+    #(json.JString(text), []) -> {
+      let parts = string.split(text, "`")
+      match list.length(parts) % 2 == 0 {
+        True -> Ok(json.JString(html.escape(text)))
+        False -> {
+          let rendered = list.index_map(parts, fn(part, index) {
+            match index % 2 {
+              0 -> html.escape(part)
+              _ -> "<code>" + html.escape(part) + "</code>"
+            }
+          })
+          Ok(json.JString(string.join(rendered, "")))
+        }
+      }
+    }
+    _ -> Error("inline_code expects text and no arguments")
+  }
+}
+
+terminal(value: json.Json, args: List(json.Json)) -> Result(json.Json, String) {
+  match #(value, args) {
+    #(json.JString(text), []) -> Ok(
+      json.JString(highlight.render(text, "terminal"))
+    )
+    _ -> Error("terminal expects text and no arguments")
+  }
+}
+
+/// JSON in an HTML script element must not contain a literal closing tag.
+json_script(value: json.Json, args: List(json.Json)) -> Result(
+  json.Json,
+  String
+) {
+  match args {
+    [] -> Ok(
+      json.JString(
+        json.encode(value) |> string.replace("<", "\\u003c") |> string.replace(
+          ">",
+          "\\u003e"
+        ) |> string.replace("&", "\\u0026")
+      )
+    )
+    _ -> Error("json_script expects no arguments")
+  }
+}
+
+format_date(value: json.Json, args: List(json.Json)) -> Result(
+  json.Json,
+  String
+) {
+  match #(value, args) {
+    #(json.JString(source), [json.JString(format)]) -> {
+      let day = date.parse(string.slice(source, 0, 10))?
+      let value = match format {
+        "%Y" -> Ok(day.year)
+        "%m-%d-%Y" -> Ok(day.month + "-" + day.day + "-" + day.year)
+        "%Y-%m-%d" -> Ok(day.year + "-" + day.month + "-" + day.day)
+        _ -> Error("unsupported date format: " + format)
+      }?
+      Ok(json.JString(value))
+    }
+    _ -> Error("date expects a date string and explicit format")
+  }
+}

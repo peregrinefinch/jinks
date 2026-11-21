@@ -1,0 +1,85 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// TOML has a few more drawers than JSON. Dates cross as their written
+//// spelling; non-finite numbers stay out rather than becoming invalid JSON.
+module value
+
+import tome
+import pooka/json
+import pooka/list
+
+to_json(value: tome.Toml) -> Result(json.Json, String) {
+  match value {
+    tome.TString(v) -> Ok(json.JString(v))
+    tome.TInt(v) -> Ok(json.JInt(v))
+    tome.TFloat(v) -> Ok(json.JFloat(v))
+    tome.TBool(v) -> Ok(json.JBool(v))
+    tome.TDate(v) -> Ok(json.JString(v))
+    tome.TDateTime(v) -> Ok(json.JString(v))
+    tome.TTime(v) -> Ok(json.JString(v))
+    tome.TArray(items) -> {
+      let entries = list.try_map(items, to_json)?
+      Ok(json.JArray(entries))
+    }
+    tome.TTable(items) -> {
+      let entries = list.try_map(items, fn(entry) {
+        let converted = to_json(entry.1)?
+        Ok(#(entry.0, converted))
+      })?
+      Ok(json.JObject(entries))
+    }
+    _ -> Error("non-finite numbers cannot be template parameters")
+  }
+}
+
+params(doc: tome.Toml) -> Result(json.Json, String) {
+  match tome.get(doc, "params") {
+    None -> Ok(json.JObject([]))
+    Some(tome.TTable(entries)) -> to_json(tome.TTable(entries))
+    Some(_) -> Error("params must be a table")
+  }
+}
+
+/// Merge object fields recursively; arrays and scalar values are replaced.
+///
+/// ```pooka
+/// // Theme palette defaults survive when the site overrides just one colour.
+/// let defaults = json.JObject([#("paper", json.JString("cream"))])
+/// assert value.merge(defaults, json.JObject([])) == defaults
+/// ```
+merge(defaults: json.Json, override: json.Json) -> json.Json {
+  match #(defaults, override) {
+    #(json.JObject(left), json.JObject(right)) -> json.JObject(
+      list.fold(right, left, fn(found, entry) {
+        let replacement = match list.key_find(found, entry.0) {
+          Some(previous) -> merge(previous, entry.1)
+          None -> entry.1
+        }
+        list.append(
+          list.filter(found, fn(old) { old.0 != entry.0 }),
+          #(entry.0, replacement)
+        )
+      })
+    )
+    _ -> override
+  }
+}
+
+/// Keep TOML types while applying collection defaults before parsing metadata.
+merge_toml(defaults: tome.Toml, override: tome.Toml) -> tome.Toml {
+  match #(defaults, override) {
+    #(tome.TTable(left), tome.TTable(right)) -> tome.TTable(
+      list.fold(right, left, fn(found, entry) {
+        let replacement = match list.key_find(found, entry.0) {
+          Some(previous) -> merge_toml(previous, entry.1)
+          None -> entry.1
+        }
+        list.append(
+          list.filter(found, fn(old) { old.0 != entry.0 }),
+          #(entry.0, replacement)
+        )
+      })
+    )
+    _ -> override
+  }
+}

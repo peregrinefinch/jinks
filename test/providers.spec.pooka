@@ -1,0 +1,82 @@
+// SPDX-License-Identifier: Apache-2.0
+module providers_test
+
+import jinks/build
+import jinks/fetch
+import jinks/provider
+import jinks/request
+import jinks/scaffold
+import jinks/server
+import jinks/storage
+import poke/should
+import pooka/int
+import pooka/json
+import pooka/path
+import pooka/process
+
+site(label: String) -> String {
+  let root = "build/jinks-tests/" + int.to_string(process.pid()) + "/provider-" + label
+  let _ = should.be_ok(scaffold.create(root))
+  root
+}
+
+test "providers are explicit offline functions with the build clock" {
+  let root = site("clock")
+  let _ = should.be_ok(
+    storage.write(
+      path.join([root, "layouts/page.html.tuck"]),
+      "{{ data.catalogue.clock }} {{ time.now() }}"
+    )
+  )
+  let selected = request.with_providers(
+    request.defaults(root),
+    [provider.Provider("catalogue", fn(context) {
+      Ok(json.JObject([#("clock", json.JString(context.timestamp))]))
+    })]
+  )
+  let #(_, pages) = should.be_ok(build.prepare_request(selected, "2026-11-19"))
+  match pages {
+    [page] -> should.equal(
+      page.text,
+      "2026-11-19T00:00:00Z 2026-11-19T00:00:00Z"
+    )
+    _ -> should.fail("expected one page")
+  }
+}
+
+test "provider data cannot silently replace authored data or another provider" {
+  let loader = provider.Provider("birds", fn(_) { Ok(json.JArray([])) })
+  let context = provider.Context(".", "2026-11-19T00:00:00Z")
+  let _ = should.be_error(
+    provider.run([loader], context, json.JObject([#("birds", json.JNull())]))
+  )
+  let _ = should.be_error(
+    provider.run([loader, loader], context, json.JObject([]))
+  )
+}
+
+test "bounded provider fetches reject oversized responses and invalid JSON" {
+  let root = site("fetch")
+  let _ = should.be_ok(build.run(root))
+  let _ = should.be_ok(
+    storage.write(path.join([root, "public/catalogue.json"]), "[1,2,3]")
+  )
+  let _ = should.be_ok(
+    storage.write(path.join([root, "public/bad.json"]), "not json")
+  )
+  let running = should.be_ok(
+    server.start(path.join([root, "public"]), "127.0.0.1", 0, False)
+  )
+  let result = should.attempt(fn() {
+    let url = "http://127.0.0.1:" + int.to_string(running.port)
+    should.equal(
+      fetch.json(url + "/catalogue.json", 1000, 100),
+      Ok(json.JArray([json.JInt(1), json.JInt(2), json.JInt(3)]))
+    )
+    let _ = should.be_error(fetch.json(url + "/catalogue.json", 1000, 2))
+    let _ = should.be_error(fetch.json(url + "/bad.json", 1000, 100))
+    let _ = should.be_error(fetch.json(url + "/missing.json", 1000, 100))
+  })
+  let _ = should.be_ok(server.stop(running))
+  let _ = should.be_ok(result)
+}

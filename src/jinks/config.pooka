@@ -1,0 +1,254 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// Read the little card beside the front door. Paths belong to the site,
+//// rather than whichever directory happened to launch the command.
+module config
+
+import tome
+import pooka/int
+import jinks/publishing_options
+import jinks/names
+import jinks/listing_options
+import jinks/section
+import jinks/value
+import pooka/json
+import pooka/list
+import pooka/string
+
+class ServerOptions(host: String, port: Int, live_reload: Bool)
+
+class BuildOptions(drafts: Bool, future: Bool, environment: String)
+
+class Config(
+  title: String,
+  base_url: String,
+  theme: String,
+  output: String,
+  params: json.Json,
+  server: ServerOptions,
+  collections: List(section.Spec),
+  build: BuildOptions,
+  listings: listing_options.Options,
+  publishing: publishing_options.Options,
+  raw_html: Bool
+)
+
+/// Missing optional settings have quiet defaults; malformed ones never do.
+///
+/// ```pooka
+/// let assert Ok(site) = config.parse("title = \"Owl\"")
+/// assert site.theme == "minimal"
+/// ```
+parse(source: String) -> Result(Config, String) {
+  let doc = match tome.parse(source) {
+    Ok(doc) -> Ok(doc)
+    Error(e) -> Error("config.toml:" + int.to_string(e.line) + ": " + e.message)
+  }?
+  let _ = match doc {
+    tome.TTable(entries) -> list.try_fold(entries, Nil, fn(_, entry) {
+      match list.any(
+        [
+          "title",
+          "base-url",
+          "theme",
+          "output-dir",
+          "params",
+          "server",
+          "collections",
+          "build",
+          "tags",
+          "publishing",
+          "markdown"
+        ],
+        fn(known) { known == entry.0 }
+      ) {
+        True -> Ok(Nil)
+        False -> Error("config.toml: unsupported setting: " + entry.0)
+      }
+    })
+    _ -> Error("config.toml must contain a table")
+  }?
+  let title = text(doc, "title", "A small jinks")?
+  let url = text(doc, "base-url", "http://localhost:4000")?
+  let theme = text(doc, "theme", "minimal")?
+  let output = text(doc, "output-dir", "public")?
+  let params = value.params(doc)?
+  let server = server_options(doc)?
+  let collections = section.parse(doc)?
+  let build = build_options(doc)?
+  let listings = listing_options.parse(doc)?
+  let publishing = publishing_options.parse(doc)?
+  let raw_html = markdown_options(doc)?
+  let _ = relative(theme)?
+  let _ = output_path(output)?
+  Ok(
+    Config(
+      title,
+      url,
+      theme,
+      output,
+      params,
+      server,
+      collections,
+      build,
+      listings,
+      publishing,
+      raw_html
+    )
+  )
+}
+
+/// Shared by configuration and direct publication APIs, so callers cannot
+/// bypass source protection by constructing their own Config value.
+output_path(output: String) -> Result(Nil, String) {
+  let _ = relative(output)?
+  let _ = match list.any(string.split(output, "/"), fn(part) {
+    string.starts_with(part, ".") || string.contains(part, ".")
+  }) {
+    True -> Error("output-dir segments must not start with or contain dots")
+    False -> Ok(Nil)
+  }?
+  let output = string.lowercase(output)
+  match list.any(
+    ["content", "themes", "static", "layouts", "data", "samples", ".jinks"],
+    fn(source) {
+      output == source || string.starts_with(output, source + "/") || string.starts_with(
+        source,
+        output + "/"
+      )
+    }
+  ) {
+    True -> Error("output-dir overlaps a source or cache directory")
+    False -> Ok(Nil)
+  }
+}
+
+text(doc: tome.Toml, key: String, fallback: String) -> Result(String, String) {
+  match tome.get(doc, key) {
+    None -> Ok(fallback)
+    Some(tome.TString(value)) -> Ok(value)
+    Some(_) -> Error(key + " must be a string")
+  }
+}
+
+/// Keep generated paths beneath their owner, including on Windows.
+relative(value: String) -> Result(String, String) {
+  let pieces = string.split(value, "/")
+  match string.is_empty(value) || string.starts_with(value, "/") || string.contains(
+    value,
+    "\\"
+  ) || string.contains(value, ":") || list.any(pieces, fn(p) {
+    p == ".." || p == "." || !names.portable(p)
+  }) {
+    True -> Error(
+      "expected a portable relative path without dot or parent segments: " + value
+    )
+    False -> Ok(value)
+  }
+}
+
+/// Listener options are applied at serve startup. A live edit changes pages;
+/// changing host or port requires restarting the command.
+server_options(doc: tome.Toml) -> Result(ServerOptions, String) {
+  let table = match tome.get(doc, "server") {
+    None -> Ok(tome.TTable([]))
+    Some(tome.TTable(entries)) -> {
+      let _ = list.try_fold(entries, Nil, fn(_, entry) {
+        match list.any(["host", "port", "live-reload"], fn(name) {
+          name == entry.0
+        }) {
+          True -> Ok(Nil)
+          False -> Error("unsupported server setting: " + entry.0)
+        }
+      })?
+      Ok(tome.TTable(entries))
+    }
+    Some(_) -> Error("server must be a table")
+  }?
+  let host = text(table, "host", "127.0.0.1")?
+  let host = match host {
+    "localhost" -> Ok("127.0.0.1")
+    "127.0.0.1" -> Ok(host)
+    "::1" -> Ok(host)
+    _ -> Error("server.host must be loopback: localhost, 127.0.0.1, or ::1")
+  }?
+  let port = match tome.get(table, "port") {
+    None -> Ok(4000)
+    Some(tome.TInt(value)) if value >= 0 && value <= 65535 -> Ok(value)
+    _ -> Error("server.port must be an integer between 0 and 65535")
+  }?
+  let live = match tome.get(table, "live-reload") {
+    None -> Ok(True)
+    Some(tome.TBool(value)) -> Ok(value)
+    _ -> Error("server.live-reload must be a Boolean")
+  }?
+  Ok(ServerOptions(host, port, live))
+}
+
+with_params(site: Config, params: json.Json) -> Config {
+  Config(
+    site.title,
+    site.base_url,
+    site.theme,
+    site.output,
+    params,
+    site.server,
+    site.collections,
+    site.build,
+    site.listings,
+    site.publishing,
+    site.raw_html
+  )
+}
+
+build_options(doc: tome.Toml) -> Result(BuildOptions, String) {
+  let table = match tome.get(doc, "build") {
+    None -> Ok(tome.TTable([]))
+    Some(tome.TTable(entries)) -> {
+      let _ = list.try_fold(entries, Nil, fn(_, entry) {
+        match list.contains(["drafts", "future", "environment"], entry.0) {
+          True -> Ok(Nil)
+          False -> Error("unsupported build setting: " + entry.0)
+        }
+      })?
+      Ok(tome.TTable(entries))
+    }
+    _ -> Error("build must be a table")
+  }?
+  let drafts = boolean(table, "drafts", False)?
+  let future = boolean(table, "future", False)?
+  let environment = text(table, "environment", "development")?
+  let _ = match list.contains(["development", "production"], environment) {
+    True -> Ok(Nil)
+    False -> Error("build.environment must be development or production")
+  }?
+  Ok(BuildOptions(drafts, future, environment))
+}
+
+boolean(doc: tome.Toml, key: String, fallback: Bool) -> Result(Bool, String) {
+  match tome.get(doc, key) {
+    None -> Ok(fallback)
+    Some(tome.TBool(value)) -> Ok(value)
+    _ -> Error(key + " must be a Boolean")
+  }
+}
+
+markdown_options(doc: tome.Toml) -> Result(Bool, String) {
+  match tome.get(doc, "markdown") {
+    None -> Ok(False)
+    Some(tome.TTable(entries)) -> {
+      let _ = list.try_fold(entries, Nil, fn(_, pair) {
+        match pair.0 == "raw-html" {
+          True -> Ok(Nil)
+          False -> Error("unsupported markdown setting: " + pair.0)
+        }
+      })?
+      match tome.get(tome.TTable(entries), "raw-html") {
+        None -> Ok(False)
+        Some(tome.TBool(value)) -> Ok(value)
+        _ -> Error("markdown.raw-html must be a Boolean")
+      }
+    }
+    _ -> Error("markdown must be a table")
+  }
+}

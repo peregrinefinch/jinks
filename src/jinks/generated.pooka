@@ -1,0 +1,168 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// Plan generated pages before rendering any of them. Their addresses join
+//// authored pages, aliases and assets in one collision check. A generated
+//// listing stays outside collections.all, preventing archives from listing
+//// themselves or acquiring tags through their own template context.
+module generated
+
+import jinks/collection
+import jinks/config
+import jinks/pagination
+import jinks/route
+import jinks/taxonomy
+import jinks/template
+import jinks/value
+import pooka/json
+import pooka/list
+
+class Job(output: String, layout: String, context: json.Json)
+
+prepare(
+  site: config.Config,
+  catalog: collection.Catalog,
+  tags: taxonomy.Index,
+  local_data: json.Json,
+  collections: json.Json
+) -> Result(List(Job), String) {
+  let archives = list.try_fold(site.listings.archives, [], fn(found, rule) {
+    let pages = match list.key_find(catalog.groups, rule.collection) {
+      Some(pages) -> pages
+      None -> []
+    }
+    let windows = pagination.windows(pages, rule.size, rule.url, rule.page_path)?
+    let jobs = list.map(windows, fn(window) {
+      let context = base(
+        site,
+        local_data,
+        collections,
+        tags,
+        rule.layout,
+        rule.title,
+        "archive",
+        rule.collection,
+        window.nav.url
+      )
+      let extra = json.JObject([
+        #(
+          "archive",
+          json.JObject(
+            [
+              #("name", json.JString(rule.collection)),
+              #("url", json.JString(window.nav.first)),
+              #("count", json.JInt(window.nav.total_items))
+            ]
+          )
+        ),
+        #("paginator", pagination.context(window, fn(page) {
+          taxonomy.page_summary(tags, page)
+        }))
+      ])
+      Job(window.nav.output, rule.layout, value.merge(context, extra))
+    })
+    Ok(list.concat(found, jobs))
+  })?
+  let tagged = list.try_fold(tags.groups, archives, fn(found, tag) {
+    let options = site.listings.tags
+    let tag_context = taxonomy.summary(tags, tag)
+    let windows = pagination.windows(
+      tag.pages,
+      options.size,
+      route.url(tag.output),
+      options.page_path
+    )?
+    let jobs = list.map(windows, fn(window) {
+      let context = base(
+        site,
+        local_data,
+        collections,
+        tags,
+        options.layout,
+        tag.name,
+        "tag",
+        options.collection,
+        window.nav.url
+      )
+      Job(window.nav.output, options.layout, value.merge(context, json.JObject([
+        #("tag", tag_context),
+        #(
+          "paginator",
+          pagination.context(window, fn(page) {
+            taxonomy.page_summary(tags, page)
+          })
+        )
+      ])))
+    })
+    Ok(list.concat(found, jobs))
+  })?
+  match #(site.listings.tags.enabled, site.listings.tags.index) {
+    #(True, Some(url)) -> {
+      let options = site.listings.tags
+      let windows = pagination.windows(
+        tags.groups,
+        options.size,
+        url,
+        options.page_path
+      )?
+      Ok(list.concat(tagged, list.map(windows, fn(window) {
+        let context = base(
+          site,
+          local_data,
+          collections,
+          tags,
+          options.index_layout,
+          options.index_title,
+          "tag-index",
+          "",
+          window.nav.url
+        )
+        Job(
+          window.nav.output,
+          options.index_layout,
+          value.merge(context, json.JObject([
+            #("paginator", pagination.context(window, fn(tag) {
+              taxonomy.summary(tags, tag)
+            }))
+          ]))
+        )
+      })))
+    }
+    _ -> Ok(tagged)
+  }
+}
+
+base(
+  site: config.Config,
+  local_data: json.Json,
+  collections: json.Json,
+  tags: taxonomy.Index,
+  layout: String,
+  title: String,
+  kind: String,
+  name: String,
+  url: String
+) -> json.Json {
+  let page = json.JObject([
+    #("title", json.JString(title)),
+    #("layout", json.JString(layout)),
+    #("order", json.JInt(0)),
+    #("slug", json.JString("")),
+    #("tag_links", json.JArray([])),
+    #("url", json.JString(url)),
+    #("kind", json.JString(kind)),
+    #("collection", json.JString(name)),
+    #("source", json.JNull()),
+    #("params", json.JObject([])),
+    #("content", json.JString("")),
+    #("previous", json.JNull()),
+    #("next", json.JNull()),
+    #("date", json.JNull()),
+    #("draft", json.JBool(False)),
+    #("tags", json.JArray([])),
+    #("aliases", json.JArray([]))
+  ])
+  value.merge(
+    template.base_context(site, page, local_data, collections),
+    json.JObject([#("taxonomies", tags.context)])
+  )
+}

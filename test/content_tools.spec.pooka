@@ -1,0 +1,286 @@
+// SPDX-License-Identifier: Apache-2.0
+module content_tools_test
+
+import jinks/build
+import jinks/content
+import jinks/request
+import jinks/route
+import jinks/scaffold
+import jinks/storage
+import poke/should
+import poke/snapshot
+import pooka/file
+import pooka/int
+import pooka/json
+import pooka/list
+import pooka/path
+import pooka/process
+import pooka/string
+
+site(name: String) -> String {
+  let root = "build/jinks-content/" + int.to_string(process.pid()) + "/" + name
+  let _ = should.be_ok(scaffold.create(root))
+  root
+}
+
+write(root: String, name: String, source: String) {
+  let _ = should.be_ok(storage.write(path.join([root, name]), source))
+  Nil
+}
+
+read(root: String, name: String) -> String {
+  should.be_ok(storage.read(path.join([root, "public", name])))
+}
+
+exists(root: String, name: String) -> Bool {
+  should.be_ok(file.exists(path.join([root, "public", name])))
+}
+
+test "standalone HTML templates render metadata without an implicit layout" {
+  let root = site("standalone")
+  write(
+    root,
+    "content/landing.html.tuck",
+    "---\ntitle = \"<Owl & Finch>\"\n---\n<h1>{{ page.title }}</h1>"
+  )
+  let _ = should.be_ok(build.run(root))
+  should.equal(read(root, "landing.html"), "<h1>&lt;Owl &amp; Finch&gt;</h1>")
+}
+
+test "extensionless Tuck pages use clean URLs and suffix matching ignores case" {
+  let root = site("suffixes")
+  write(root, "content/notes/owl.tuck", "<p>Owl</p>")
+  write(root, "content/promo.HTML.TUCK", "<p>Promo</p>")
+  let _ = should.be_ok(build.run(root))
+  should.equal(read(root, "notes/owl/index.html"), "<p>Owl</p>")
+  should.equal(read(root, "promo.HTML"), "<p>Promo</p>")
+  should.equal(route.template_output("index.tuck"), Ok("index.html"))
+  let _ = should.be_error(route.template_output("not-a-template.md"))
+}
+
+test "standalone pages inherit theme blocks and include theme partials" {
+  let root = site("inheritance")
+  write(
+    root,
+    "themes/minimal/layouts/base.html.tuck",
+    "<!doctype html>\n<title>{% block title %}Home{% endblock %}</title>\n<main>\n{% block body %}{% endblock %}\n</main>\n"
+  )
+  write(
+    root,
+    "themes/minimal/layouts/card.html.tuck",
+    "<p>{{ data.profile.name }}</p>"
+  )
+  write(root, "data/profile.toml", "name = \"<Finch>\"")
+  write(
+    root,
+    "content/about.html.tuck",
+    "---\ntitle = \"About\"\n---\n{% extends \"base.html.tuck\" %}{% block title %}{{ page.title }}{% endblock %}{% block body %}{% include \"card.html.tuck\" %}{% endblock %}"
+  )
+  let _ = should.be_ok(build.run(root))
+  snapshot.snap(read(root, "about.html"), "standalone-inheritance")
+}
+
+test "an optional layout wraps rendered Tuck content once" {
+  let root = site("wrapping")
+  write(root, "layouts/frame.html.tuck", "<main>{{ content | safe }}</main>")
+  write(
+    root,
+    "content/about.html.tuck",
+    "---\ntitle = \"<Owl>\"\nlayout = \"frame\"\n---\n<strong>{{ page.title }}</strong>"
+  )
+  let _ = should.be_ok(build.run(root))
+  should.equal(
+    read(root, "about.html"),
+    "<main><strong>&lt;Owl&gt;</strong></main>"
+  )
+}
+
+test "empty layout renders a Markdown body without a theme wrapper" {
+  let root = site("no-layout")
+  write(root, "content/plain.md", "---\nlayout = \"\"\n---\n# Words")
+  let _ = should.be_ok(build.run(root))
+  should.equal(read(root, "plain/index.html"), "<h1 id=\"words\">Words</h1>\n")
+}
+
+test "XML escapes metadata and JSON output uses the JSON filter without HTML escaping" {
+  let root = site("formats")
+  write(
+    root,
+    "content/status.xml.tuck",
+    "---\ntitle = \"<Owl & Finch>\"\n---\n<status>{{ page.title }}</status>"
+  )
+  write(root, "content/search.json.tuck", "{{ data.profile | json }}")
+  write(root, "data/profile.toml", "name = \"A \\\"quoted\\\" owl & <more>\"")
+  let _ = should.be_ok(build.run(root))
+  should.equal(
+    read(root, "status.xml"),
+    "<status>&lt;Owl &amp; Finch&gt;</status>"
+  )
+  let parsed = should.be_ok(json.decode(read(root, "search.json")))
+  should.equal(
+    json.get(parsed, "name"),
+    Some(json.JString("A \"quoted\" owl & <more>"))
+  )
+}
+
+test "slug overrides preserve a standalone file's output format" {
+  let page = should.be_ok(
+    content.parse("status.xml.tuck", "---\nslug = \"health\"\n---\n<ok/>")
+  )
+  should.equal(page.output, "health.xml")
+  let explicit = should.be_ok(
+    content.parse(
+      "search.json.tuck",
+      "---\npermalink = \"/api/search.json\"\n---\n{}"
+    )
+  )
+  should.equal(explicit.output, "api/search.json")
+}
+
+test "Tuck errors retain the content filename and front matter line offset" {
+  let root = site("diagnostics")
+  write(
+    root,
+    "content/broken.html.tuck",
+    "---\ntitle = \"Broken\"\n---\n{{ missing }}"
+  )
+  let error = should.be_error(build.run(root))
+  should.be_true(string.contains(error, "broken.html.tuck:4:"))
+  should.be_false(string.contains(error, "__jinks_internal"))
+}
+
+test "collection summaries never expose standalone template source" {
+  let root = site("summaries")
+  write(root, "config.toml", "[collections.posts]\npath = \"posts\"")
+  write(
+    root,
+    "content/posts/example.html.tuck",
+    "---\ntitle = \"Example\"\n---\nsource-marker {{ page.title }}"
+  )
+  write(
+    root,
+    "layouts/page.html.tuck",
+    "{% for p in collections.posts %}{{ p.kind }}|{{ p.content }}|{{ p.title }}{% endfor %}"
+  )
+  let _ = should.be_ok(build.run(root))
+  should.equal(read(root, "index.html"), "template||Example")
+  should.equal(read(root, "posts/example.html"), "source-marker Example")
+}
+
+test "Markdown and Tuck pages cannot claim the same canonical URL" {
+  let root = site("collision")
+  write(root, "content/owl.md", "# Owl")
+  write(root, "content/owl.tuck", "<p>Another owl</p>")
+  let _ = should.be_error(build.run(root))
+  should.be_false(exists(root, "index.html"))
+}
+
+test "aliases create escaped static HTML redirects to the canonical page" {
+  let root = site("aliases")
+  write(
+    root,
+    "content/new.md",
+    "---\nslug = \"new owl\"\naliases = [\"/old/\", \"/older.html\"]\n---\n# New"
+  )
+  let _ = should.be_ok(build.run(root))
+  let alias = read(root, "old/index.html")
+  snapshot.snap(alias, "alias-page")
+  should.be_true(string.contains(alias, "href=\"/new%20owl/\""))
+  should.be_true(string.contains(alias, "http-equiv=\"refresh\""))
+  should.be_true(string.contains(alias, "Continue to the page"))
+  should.be_true(exists(root, "older.html"))
+  should.be_true(exists(root, "new owl/index.html"))
+}
+
+test "aliases reject unsafe URLs, non-HTML targets and self redirects" {
+  loop declaration in [
+    "aliases = [1]",
+    "aliases = true",
+    "aliases = [\"https://example.org/\"]",
+    "aliases = [\"/../outside\"]",
+    "aliases = [\"/api.json\"]",
+    "aliases = [\"/about/\"]"
+  ] {
+    let _ = should.be_error(
+      content.parse("about.md", "---\n" + declaration + "\n---\nHi")
+    )
+  }
+}
+
+test "alias collisions fail before changing previous output" {
+  let root = site("alias-collision")
+  let _ = should.be_ok(build.run(root))
+  let before = read(root, "index.html")
+  write(root, "content/another.md", "---\naliases = [\"/\"]\n---\nOther")
+  let _ = should.be_error(build.run(root))
+  should.equal(read(root, "index.html"), before)
+}
+
+test "removed aliases disappear on the next successful publication" {
+  let root = site("stale-alias")
+  write(root, "content/new.md", "---\naliases = [\"/old/\"]\n---\nNew")
+  let _ = should.be_ok(build.run(root))
+  should.be_true(exists(root, "old/index.html"))
+  write(root, "content/new.md", "# New")
+  let _ = should.be_ok(build.run(root))
+  should.be_false(exists(root, "old/index.html"))
+  should.be_true(exists(root, "new/index.html"))
+}
+
+test "hidden future pages also hide their aliases" {
+  let root = site("future-alias")
+  write(
+    root,
+    "content/later.md",
+    "---\ndate = 2099-01-01\naliases = [\"/secret/\"]\n---\nLater"
+  )
+  let #(_, outputs) = should.be_ok(build.prepare_at(root, "2020-01-01"))
+  should.be_false(list.any(outputs, fn(page) {
+    page.name == "secret/index.html"
+  }))
+}
+
+test "Tuck syntax errors use source lines before any publication" {
+  let root = site("syntax-error")
+  write(
+    root,
+    "content/broken.html.tuck",
+    "---\ntitle = \"Broken\"\n---\n{% if %}"
+  )
+  let error = should.be_error(build.run(root))
+  should.be_true(string.contains(error, "broken.html.tuck:4:"))
+  should.be_false(string.contains(error, "__jinks_internal"))
+  should.be_false(exists(root, "index.html"))
+}
+
+test "partial errors retain their own location instead of the parent metadata offset" {
+  let root = site("partial-error")
+  write(root, "layouts/card.html.tuck", "{{ absent }}")
+  write(
+    root,
+    "content/about.html.tuck",
+    "---\ntitle = \"About\"\n---\n{% include \"card.html.tuck\" %}"
+  )
+  let error = should.be_error(build.run(root))
+  should.be_true(string.contains(error, "card.html.tuck:1:"))
+  should.be_false(string.contains(error, "__jinks_internal"))
+}
+
+test "alias paths cannot collide with static assets even through case differences" {
+  let root = site("alias-asset")
+  write(root, "content/new.md", "---\naliases = [\"/old/\"]\n---\nNew")
+  write(root, "static/OLD/index.html", "A static page")
+  let _ = should.be_error(build.prepare(root))
+  should.be_false(exists(root, "index.html"))
+}
+
+test "alias refreshes and links retain the base-url deployment prefix" {
+  let root = site("prefixed-alias")
+  write(root, "config.toml", "base-url = \"https://example.org/blog/\"\n")
+  write(root, "content/new.md", "---\naliases = [\"/old/\"]\n---\nNew")
+  let _ = should.be_ok(build.run(root))
+  let alias = read(root, "old/index.html")
+  should.be_true(string.contains(alias, "href=\"/blog/new/\""))
+  should.be_true(string.contains(alias, "url=/blog/new/"))
+  let _ = should.be_ok(build.check_selected(request.defaults(root)))
+}

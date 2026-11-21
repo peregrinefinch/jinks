@@ -1,0 +1,106 @@
+// SPDX-License-Identifier: Apache-2.0
+module pagination_test
+
+import jinks/pagination
+import jinks/route
+import jinks/publish
+import poke/should
+import pooka/json
+import pooka/list
+
+as_json(n: Int) -> json.Json {
+  json.JInt(n)
+}
+
+test "pagination preserves order and emits no redundant page one route" {
+  let windows = should.be_ok(
+    pagination.windows([5, 4, 3, 2, 1], 2, "/notes/", "page")
+  )
+  should.equal(list.map(windows, fn(w) { w.items }), [[5, 4], [3, 2], [1]])
+  should.equal(
+    list.map(windows, fn(w) { w.nav.url }),
+    ["/notes/", "/notes/page/2/", "/notes/page/3/"]
+  )
+  let first = should.be_some(list.first(windows))
+  should.equal(first.nav.previous, None)
+  should.equal(first.nav.next, Some("/notes/page/2/"))
+  let last = should.be_some(list.last(windows))
+  should.equal(last.nav.previous, Some("/notes/page/2/"))
+  should.equal(last.nav.next, None)
+  should.equal(last.nav.first_item, 5)
+  should.equal(last.nav.last_item, 5)
+}
+
+test "empty input still has one empty first page with zero item bounds" {
+  let windows = should.be_ok(pagination.windows([], 30, "/", "page"))
+  should.equal(list.length(windows), 1)
+  let window = should.be_some(list.first(windows))
+  should.equal(window.nav.output, "index.html")
+  should.equal(window.nav.total_pages, 1)
+  should.equal(window.nav.total_items, 0)
+  should.equal(window.nav.first_item, 0)
+  should.equal(window.nav.last_item, 0)
+  should.equal(window.nav.previous, None)
+  should.equal(window.nav.next, None)
+}
+
+test "navigation windows are bounded and mark gaps between distant links" {
+  let windows = should.be_ok(
+    pagination.windows(list.range(0, 100), 1, "/", "page")
+  )
+  let middle = should.be_some(list.at(windows, 49))
+  should.be_true(list.length(middle.nav.links) <= 7)
+  should.equal(
+    list.map(middle.nav.links, fn(link) { link.0 }),
+    [1, 48, 49, 50, 51, 52, 100]
+  )
+  let context = pagination.context(middle, as_json)
+  should.equal(json.get(context, "number"), Some(json.JInt(50)))
+  let links = match json.get(context, "links") {
+    Some(json.JArray(items)) -> items
+    _ -> []
+  }
+  let after_gap = should.be_some(list.at(links, 1))
+  should.equal(json.get(after_gap, "gap"), Some(json.JBool(True)))
+}
+
+test "custom pagination paths and Unicode bases produce canonical public URLs" {
+  let windows = should.be_ok(
+    pagination.windows([1, 2], 1, "/caf%C3%A9/", "more pages")
+  )
+  let second = should.be_some(list.last(windows))
+  should.equal(second.nav.url, "/caf%C3%A9/more%20pages/2/")
+  should.equal(second.nav.output, "café/more pages/2/index.html")
+  should.equal(route.permalink("/notes.html/"), Ok("notes.html/index.html"))
+}
+
+test "invalid pagination sizes and traversal paths fail" {
+  let _ = should.be_error(pagination.windows([1], 0, "/", "page"))
+  let _ = should.be_error(pagination.windows([1], -1, "/", "page"))
+  let _ = should.be_error(pagination.windows([1], 1, "/", "../escape"))
+  let _ = should.be_error(pagination.windows([1], 1, "/list.html", "page"))
+}
+
+test "canonically equivalent Unicode routes cannot claim two output files" {
+  should.equal(route.permalink("/caf\u{e9}/"), route.permalink("/cafe\u{301}/"))
+  let _ = should.be_error(
+    publish.validate(["café/index.html", "cafe\u{301}/index.html"])
+  )
+}
+
+test "pagination partitions many input lengths without losing or duplicating items" {
+  loop count in list.range(0, 45) {
+    loop size in list.range(1, 12) {
+      let items = list.range(0, count)
+      let windows = should.be_ok(
+        pagination.windows(items, size, "/archive/", "page")
+      )
+      should.equal(list.flat_map(windows, fn(w) { w.items }), items)
+      should.be_true(list.all(windows, fn(w) {
+        list.length(w.items) <= size && list.length(w.nav.links) <= 7
+      }))
+      let names = list.map(windows, fn(w) { w.nav.output })
+      should.equal(list.length(list.unique(names)), list.length(names))
+    }
+  }
+}

@@ -1,0 +1,120 @@
+// SPDX-License-Identifier: Apache-2.0
+module filters_test
+
+import jinks/filters
+import jinks/build
+import jinks/helpers
+import jinks/scaffold
+import jinks/storage
+import jinks/watch
+import poke/should
+import poke/snapshot
+import jinks/markdown
+import pooka/int
+import pooka/string
+import pooka/json
+import pooka/path
+import pooka/process
+import tuck
+
+test "collection filters retain explicit ordering and missing fields sort last" {
+  let owl = json.JObject(
+    [
+      #("name", json.JString("Owl")),
+      #("order", json.JInt(2)),
+      #("group", json.JString("Birds"))
+    ]
+  )
+  let finch = json.JObject(
+    [
+      #("name", json.JString("Finch")),
+      #("order", json.JInt(1)),
+      #("group", json.JString("Birds"))
+    ]
+  )
+  let fox = json.JObject(
+    [#("name", json.JString("Fox")), #("group", json.JString("Others"))]
+  )
+  let items = json.JArray([owl, fox, finch])
+  should.equal(
+    filters.sort_by(items, [json.JString("order")]),
+    Ok(json.JArray([finch, owl, fox]))
+  )
+  should.equal(
+    filters.where(items, [json.JString("group"), json.JString("Birds")]),
+    Ok(json.JArray([owl, finch]))
+  )
+  should.equal(
+    filters.distinct(items, [json.JString("group")]),
+    Ok(json.JArray([json.JString("Birds"), json.JString("Others")]))
+  )
+  let _ = should.be_error(filters.sort_by(json.JString("oops"), []))
+}
+
+test "inline-code helpers escape authored HTML and keep unmatched backticks plain" {
+  should.equal(
+    filters.inline_code(json.JString("Use `<owl>` & friends"), []),
+    Ok(json.JString("Use <code>&lt;owl&gt;</code> &amp; friends"))
+  )
+  should.equal(
+    filters.inline_code(json.JString("Use `<owl>"), []),
+    Ok(json.JString("Use `&lt;owl&gt;"))
+  )
+}
+
+test "source samples stay beneath their declared directory and trigger watching" {
+  let root = "build/jinks-tests/" + int.to_string(process.pid()) + "/sample-helper"
+  let _ = should.be_ok(scaffold.create(root))
+  let _ = should.be_ok(
+    storage.write(path.join([root, "samples/hello.pooka"]), "echo \"Owl\"")
+  )
+  let _ = should.be_ok(
+    storage.write(
+      path.join([root, "layouts/page.html.tuck"]),
+      "{{ sample('hello') | safe }}"
+    )
+  )
+  let _ = should.be_ok(build.prepare(root))
+  let before = should.be_ok(watch.snapshot(root))
+  let _ = should.be_ok(
+    storage.write(path.join([root, "samples/hello.pooka"]), "echo \"Finch\"")
+  )
+  should.be_false(before == should.be_ok(watch.snapshot(root)))
+  let library = should.be_ok(helpers.with_samples(tuck.library(), root))
+  let library = should.be_ok(
+    tuck.add(
+      library,
+      "bad.html.tuck",
+      "{{ sample('../config', 'toml') | safe }}"
+    )
+  )
+  let _ = should.be_error(
+    tuck.render_named(library, "bad.html.tuck", json.JObject([]))
+  )
+}
+
+test "publishing Markdown retains a reviewed highlighted HTML shape" {
+  let #(body, _) = markdown.author(
+    "# Owl\n\n## A *small* corner\n\n```pooka\necho \"<owl>\"\n```",
+    False
+  )
+  snapshot.snap(body, "markdown-publishing")
+}
+
+test "JSON script output cannot close its containing HTML element" {
+  let rendered = should.be_ok(
+    filters.json_script(
+      json.JObject(
+        [#("title", json.JString("</script><script>bad()</script>&"))]
+      ),
+      []
+    )
+  )
+  match rendered {
+    json.JString(text) -> {
+      should.be_false(string.contains(text, "</script>"))
+      let _ = should.be_ok(json.decode(text))
+    }
+    _ -> should.fail("expected encoded JSON text")
+  }
+}

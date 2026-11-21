@@ -1,0 +1,184 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// Arrange the shelves once before rendering. Ties use source paths, even
+//// for descending order, so a filesystem's enumeration order never decides
+//// which article sits next to another. Neighbours are summaries, not recursive
+//// page graphs, keeping the template boundary finite.
+module collection
+
+import jinks/content
+import jinks/route
+import jinks/section
+import jinks/value
+import pooka/int
+import pooka/json
+import pooka/dict
+import pooka/list
+import pooka/order.{Order}
+import pooka/string
+
+class Neighbours(previous: Option(content.Page), next: Option(content.Page))
+
+class Catalog(
+  groups: List(#(String, List(content.Page))),
+  context: json.Json,
+  neighbours: dict.Dict(String, Neighbours)
+)
+
+summary(page: content.Page) -> json.Json {
+  let published = match page.published {
+    Some(day) -> json.JString(day)
+    None -> json.JNull()
+  }
+  value.merge(page.metadata, json.JObject([
+    #("title", json.JString(page.title)),
+    #("layout", json.JString(page.layout)),
+    #("draft", json.JBool(page.draft)),
+    #("aliases", json.JArray(list.map(page.aliases, fn(alias) {
+      json.JString(route.url(alias))
+    }))),
+    #("url", json.JString(route.url(page.output))),
+    #("params", page.params),
+    #("source", json.JString(page.name)),
+    #("collection", json.JString(page.collection)),
+    #("date", published),
+    #("year", json.JString(match page.published {
+      Some(day) -> string.slice(day, 0, 4)
+      None -> ""
+    })),
+    #("order", json.JInt(page.order)),
+    #("slug", json.JString(page.slug)),
+    #("tags", json.JArray(list.map(page.tags, fn(tag) { json.JString(tag) }))),
+    #("tag_links", json.JArray([])),
+    #("kind", json.JString(match page.kind {
+      content.Kind.Markdown -> "markdown"
+      content.Kind.Template -> "template"
+    })),
+    #("content", json.JString(match page.kind {
+      content.Kind.Markdown -> page.body
+      content.Kind.Template -> ""
+    }))
+  ]))
+}
+
+members(spec: section.Spec, pages: List(content.Page)) -> Result(
+  List(content.Page),
+  String
+) {
+  let selected = list.filter(pages, fn(page) { page.collection == spec.name })
+  let _ = match spec.sort == "date" && list.any(selected, fn(page) {
+    page.published == None
+  }) {
+    True -> Error(
+      "date-sorted collection " + spec.name + " requires a date on every published page"
+    )
+    False -> Ok(Nil)
+  }?
+  Ok(list.sort_by(selected, fn(left, right) {
+    let comparison = match spec.sort {
+      "title" -> string.compare(left.title, right.title)
+      "order" -> int.compare(left.order, right.order)
+      "date" -> string.compare(day(left), day(right))
+      _ -> string.compare(left.name, right.name)
+    }
+    match comparison {
+      Order.Equal -> string.compare(left.name, right.name)
+      _ -> match spec.descending {
+        True -> order.reverse(comparison)
+        False -> comparison
+      }
+    }
+  }))
+}
+
+day(page: content.Page) -> String {
+  match page.published {
+    Some(day) -> day
+    None -> ""
+  }
+}
+
+/// Sort each configured collection once and reuse it for every page context.
+prepare(specs: List(section.Spec), pages: List(content.Page)) -> Result(
+  Catalog,
+  String
+) {
+  let all = list.sort_by(pages, fn(left, right) {
+    string.compare(left.name, right.name)
+  })
+  let groups = list.try_map(specs, fn(spec) {
+    let sorted = members(spec, pages)?
+    Ok(#(spec.name, sorted))
+  })?
+  let neighbours = list.fold(groups, dict.empty(), fn(found, group) {
+    index_neighbours(group.1, None, found)
+  })
+  let entries = list.map(groups, fn(group) {
+    #(group.0, json.JArray(list.map(group.1, summary)))
+  })
+  Ok(
+    Catalog(
+      groups,
+      json.JObject([#("all", json.JArray(list.map(all, summary))), ..entries]),
+      neighbours
+    )
+  )
+}
+
+index(specs: List(section.Spec), pages: List(content.Page)) -> Result(
+  json.Json,
+  String
+) {
+  let catalog = prepare(specs, pages)?
+  Ok(catalog.context)
+}
+
+page_context(
+  page: content.Page,
+  specs: List(section.Spec),
+  pages: List(content.Page)
+) -> Result(json.Json, String) {
+  let catalog = prepare(specs, pages)?
+  Ok(context_for(page, catalog))
+}
+
+context_for(page: content.Page, catalog: Catalog) -> json.Json {
+  context_with(page, catalog, summary)
+}
+
+context_with(
+  page: content.Page,
+  catalog: Catalog,
+  project: fn(content.Page) -> json.Json
+) -> json.Json {
+  let pair = catalog.neighbours.get_or(page.name, Neighbours(None, None))
+  let previous = match pair.previous {
+    None -> json.JNull()
+    Some(page) -> project(page)
+  }
+  let next = match pair.next {
+    None -> json.JNull()
+    Some(page) -> project(page)
+  }
+  value.merge(
+    project(page),
+    json.JObject([#("previous", previous), #("next", next)])
+  )
+}
+
+// Walk each ordered shelf once. Stored neighbours are typed page references;
+// only the final projection makes finite JSON summaries for a template.
+index_neighbours(
+  pages: List(content.Page),
+  previous: Option(content.Page),
+  found: dict.Dict(String, Neighbours)
+) -> dict.Dict(String, Neighbours) {
+  match pages {
+    [] -> found
+    [page, ..rest] -> index_neighbours(
+      rest,
+      Some(page),
+      found.insert(page.name, Neighbours(previous, list.first(rest)))
+    )
+  }
+}

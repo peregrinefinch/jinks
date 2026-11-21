@@ -1,0 +1,166 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// Put the next edition beside the old one before changing the sign outside.
+//// The manifest names only Jinks's files. Everything else is carried forward,
+//// and a newly generated path may not quietly claim an unowned file.
+module publish
+
+import jinks/boundary
+import jinks/config
+import jinks/names
+import jinks/storage
+import pooka/file
+import pooka/json
+import pooka/list
+import pooka/path
+import pooka/string
+
+manifest() -> String {
+  ".jinks-manifest.json"
+}
+
+/// Validate names before touching staging, including case-folded collisions.
+/// This keeps an output built on Unix portable to a Windows checkout.
+validate(names: List(String)) -> Result(Nil, String) {
+  let _ = list.try_fold(names, [], fn(found, name) {
+    let _ = config.relative(name)?
+    let _ = match string.lowercase(name) == manifest() || string.starts_with(
+      string.lowercase(name),
+      "__jinks/"
+    ) || string.lowercase(name) == "__jinks" {
+      True -> Error("reserved output path: " + name)
+      False -> Ok(Nil)
+    }?
+    match list.any(found, fn(previous) { conflicts(previous, name) }) {
+      True -> Error("output paths collide: " + name)
+      False -> Ok(list.append(found, name))
+    }
+  })?
+  Ok(Nil)
+}
+
+conflicts(left: String, right: String) -> Bool {
+  let left = names.canonical(string.lowercase(names.canonical(left)))
+  let right = names.canonical(string.lowercase(names.canonical(right)))
+  left == right || string.starts_with(left, right + "/") || string.starts_with(
+    right,
+    left + "/"
+  )
+}
+
+/// The on-disk format is versioned. A broken manifest never becomes permission
+/// to delete files; publication stops until the author can inspect it.
+///
+/// ```pooka
+/// assert publish.decode(publish.encode(["index.html"])) == Ok(["index.html"])
+/// ```
+decode(source: String) -> Result(List(String), String) {
+  let doc = match json.decode(source) {
+    Ok(value) -> Ok(value)
+    Error(_) -> Error("invalid Jinks ownership manifest")
+  }?
+  let _ = match json.get(doc, "version") {
+    Some(json.JInt(1)) -> Ok(Nil)
+    _ -> Error("unsupported Jinks ownership manifest version")
+  }?
+  let items = match json.get(doc, "files") {
+    Some(json.JArray(items)) -> Ok(items)
+    _ -> Error("Jinks ownership manifest needs a files array")
+  }?
+  let names = list.try_map(items, fn(item) {
+    match item {
+      json.JString(name) -> Ok(name)
+      _ -> Error("Jinks ownership manifest paths must be strings")
+    }
+  })?
+  let _ = validate(names)?
+  Ok(names)
+}
+
+encode(names: List(String)) -> String {
+  json.encode_pretty(json.JObject([
+    #("version", json.JInt(1)),
+    #("files", json.JArray(list.map(list.sort(names), fn(name) {
+      json.JString(name)
+    })))
+  ])) + "\n"
+}
+
+owned(output: String) -> Result(List(String), String) {
+  let name = path.join([output, manifest()])
+  match file.exists(name) {
+    Ok(False) -> Ok([])
+    Ok(True) -> decode(storage.read(name)?)
+    Error(e) -> Error(e.path + ": " + e.message)
+  }
+}
+
+/// Build all files in a private sibling, then let the boundary exchange trees.
+/// Example ownership: deleting content/owl.md removes owl/index.html on the
+/// next build, while an unowned public/notes.txt survives unchanged.
+run(
+  root: String,
+  output: String,
+  pages: List(#(String, String)),
+  assets: List(#(String, String))
+) -> Result(Nil, String) {
+  let _ = config.output_path(output)?
+  let names = list.concat(
+    list.map(pages, fn(page) { page.0 }),
+    list.map(assets, fn(asset) { asset.0 })
+  )
+  let _ = validate(names)?
+  boundary.staged(root, output, fn(stage, previous) {
+    let was_owned = owned(previous)?
+    let existing = match file.is_directory(previous) {
+      Ok(True) -> storage.files(previous, "")
+      Ok(False) -> Ok([])
+      Error(e) -> Error(e.message)
+    }?
+    let keep = list.filter(existing, fn(name) {
+      name != manifest() && !list.any(was_owned, fn(owned_name) {
+        owned_name == name
+      })
+    })
+    let _ = list.try_fold(keep, Nil, fn(_, name) {
+      let _ = match list.any(names, fn(generated) {
+        conflicts(name, generated)
+      }) {
+        True -> Error("refusing to overwrite an unowned output file: " + name)
+        False -> Ok(Nil)
+      }?
+      copy(path.join([previous, name]), path.join([stage, name]))
+    })?
+    let _ = list.try_fold(pages, Nil, fn(_, page) {
+      storage.write(path.join([stage, page.0]), page.1)
+    })?
+    let _ = list.try_fold(assets, Nil, fn(_, asset) {
+      copy(asset.1, path.join([stage, asset.0]))
+    })?
+    storage.write(path.join([stage, manifest()]), encode(names))
+  })
+}
+
+copy(source: String, destination: String) -> Result(Nil, String) {
+  let _ = boundary.tree(source)?
+  let _ = match file.create_directories(path.dirname(destination)) {
+    Ok(_) -> Ok(Nil)
+    Error(e) -> Error(e.message)
+  }?
+  match file.copy(source, destination) {
+    Ok(_) -> Ok(Nil)
+    Error(e) -> Error(e.path + ": " + e.message)
+  }
+}
+
+/// Cleaning is publication of an empty owned set. Unowned files and the
+/// versioned empty manifest remain; no source/cache directory is removed.
+clean(root: String, output: String) -> Result(Nil, String) {
+  let _ = config.output_path(output)?
+  let _ = boundary.guard(root, output)?
+  match file.exists(path.join([root, output])) {
+    Ok(False) -> Ok(Nil)
+    Ok(True) -> run(root, output, [], [])
+    Error(e) -> Error(e.message)
+  }
+}

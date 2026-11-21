@@ -1,0 +1,205 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// A crawler and a feed reader should see the same published shelves as a
+//// visitor. Index failures must leave yesterday's site intact, just as a bad
+//// template does.
+module publishing_test
+
+import jinks/build
+import jinks/config
+import jinks/publishing
+import jinks/request
+import jinks/scaffold
+import jinks/storage
+import poke/should
+import pooka/file
+import pooka/int
+import pooka/json
+import pooka/path
+import pooka/process
+import pooka/string
+
+site(label: String) -> String {
+  let root = "build/jinks-tests/" + int.to_string(process.pid()) + "/publishing-" + label
+  let _ = should.be_ok(scaffold.create(root))
+  let _ = should.be_ok(
+    storage.write(
+      path.join([root, "config.toml"]),
+      "title = \"Owls & friends\"\nbase-url = \"https://example.org/blog/\"\n[collections.posts]\npath = \"posts\"\nsort = \"date\"\n[publishing]\nfeed = true\nsitemap = true\nsearch = true\nrobots = true\n"
+    )
+  )
+  let _ = should.be_ok(
+    storage.write(
+      path.join([root, "content/posts/owl.md"]),
+      "---\ntitle = \"<Owl> & Finch\"\ndate = \"2026-01-02\"\n---\nA **small** owl & a friend."
+    )
+  )
+  root
+}
+
+test "publishing exports use escaped absolute URLs and plain search text" {
+  let root = site("exports")
+  let _ = should.be_ok(build.run(root))
+  let feed = should.be_ok(storage.read(path.join([root, "public/feed.xml"])))
+  should.be_true(string.contains(feed, "&lt;Owl&gt; &amp; Finch"))
+  should.be_true(string.contains(feed, "https://example.org/blog/posts/owl/"))
+  should.be_true(string.contains(feed, "2026-01-02T00:00:00Z"))
+  let sitemap = should.be_ok(
+    storage.read(path.join([root, "public/sitemap.xml"]))
+  )
+  should.be_true(
+    string.contains(sitemap, "https://example.org/blog/posts/owl/")
+  )
+  let text = should.be_ok(storage.read(path.join([root, "public/search.json"])))
+  let _ = should.be_ok(json.decode(text))
+  should.be_true(string.contains(text, "small"))
+  should.be_false(string.contains(text, "<strong>"))
+  let robots = should.be_ok(
+    storage.read(path.join([root, "public/robots.txt"]))
+  )
+  should.be_true(
+    string.contains(robots, "Sitemap: https://example.org/blog/sitemap.xml")
+  )
+}
+
+test "drafts and future pages stay out of every generated index" {
+  let root = site("visibility")
+  let _ = should.be_ok(
+    storage.write(
+      path.join([root, "content/posts/draft.md"]),
+      "---\ntitle = \"Hidden owl\"\ndate = \"2026-01-01\"\ndraft = true\n---\nHidden"
+    )
+  )
+  let _ = should.be_ok(
+    storage.write(
+      path.join([root, "content/posts/future.md"]),
+      "---\ntitle = \"Future owl\"\ndate = \"9999-01-01\"\n---\nFuture"
+    )
+  )
+  let #(_, outputs) = should.be_ok(
+    build.prepare_request(request.defaults(root), "2026-01-03")
+  )
+  loop output in outputs {
+    should.be_false(string.contains(output.text, "Hidden owl"))
+    should.be_false(string.contains(output.text, "Future owl"))
+  }
+}
+
+test "export collisions cannot replace an existing successful build" {
+  let root = site("collision")
+  let _ = should.be_ok(build.run(root))
+  let before = should.be_ok(storage.read(path.join([root, "public/feed.xml"])))
+  let _ = should.be_ok(
+    storage.write(path.join([root, "static/feed.xml"]), "authored")
+  )
+  let _ = should.be_error(build.run(root))
+  should.equal(
+    should.be_ok(storage.read(path.join([root, "public/feed.xml"]))),
+    before
+  )
+}
+
+test "disabling exports removes their owned stale files" {
+  let root = site("stale")
+  let _ = should.be_ok(build.run(root))
+  let _ = should.be_ok(
+    storage.write(path.join([root, "config.toml"]), "title = \"Quiet\"")
+  )
+  let _ = should.be_ok(build.run(root))
+  should.be_false(
+    should.be_ok(file.exists(path.join([root, "public/feed.xml"])))
+  )
+  should.be_false(
+    should.be_ok(file.exists(path.join([root, "public/search.json"])))
+  )
+}
+
+test "publishing rejects misspelled settings and unsuitable canonical roots" {
+  let _ = should.be_error(config.parse("[publishing]\nfeeds = true"))
+  let _ = should.be_error(config.parse("[publishing]\nfeed = \"yes\""))
+  let _ = should.be_error(config.parse("[publishing]\ncollection = \"\""))
+  loop url in [
+    "/blog",
+    "javascript:alert(1)",
+    "https://user:secret@example.org",
+    "https://example.org/?a=b",
+    "https://example.org/#fragment"
+  ] {
+    let _ = should.be_error(publishing.validate_base(url))
+  }
+  should.equal(publishing.validate_base("https://example.org/blog/"), Ok(Nil))
+}
+
+test "search text decodes entities once instead of treating code as markup" {
+  should.equal(
+    publishing.plain("<p>&lt;owl&gt; &amp; &amp;lt;</p>"),
+    " <owl> & &lt; "
+  )
+}
+
+test "RSS feeds preserve publication days and an explicit entry limit" {
+  let root = site("rss")
+  let source = should.be_ok(storage.read(path.join([root, "config.toml"])))
+  let _ = should.be_ok(
+    storage.write(
+      path.join([root, "config.toml"]),
+      source + "feed-format = \"rss\"\nfeed-limit = 1\n"
+    )
+  )
+  let _ = should.be_ok(build.run(root))
+  let feed = should.be_ok(storage.read(path.join([root, "public/feed.xml"])))
+  should.be_true(string.contains(feed, "<rss version=\"2.0\">"))
+  should.be_true(
+    string.contains(feed, "<pubDate>02 Jan 2026 00:00:00 GMT</pubDate>")
+  )
+}
+
+test "standalone pages enter search as rendered text rather than template code" {
+  let root = site("template-search")
+  let _ = should.be_ok(
+    storage.write(
+      path.join([root, "content/landing.html.tuck"]),
+      "---\ntitle = \"Landing\"\n---\n<p>{{ site.title }}</p>"
+    )
+  )
+  let _ = should.be_ok(build.run(root))
+  let search = should.be_ok(
+    storage.read(path.join([root, "public/search.json"]))
+  )
+  should.be_false(string.contains(search, "{{ site.title }}"))
+  should.be_true(string.contains(search, "Owls & friends"))
+}
+
+test "migrated Atom feeds keep stable feed and entry identifiers" {
+  let root = site("identifiers")
+  let _ = should.be_ok(
+    storage.write(
+      path.join([root, "content/posts/owl.md"]),
+      "---\ntitle = \"Owl\"\ndate = \"2026-01-02\"\nfeed_id = \"https://example.org/old/owl\"\n---\nOwl"
+    )
+  )
+  let _ = should.be_ok(build.run(root))
+  let feed = should.be_ok(storage.read(path.join([root, "public/feed.xml"])))
+  should.be_true(
+    string.contains(feed, "<id>https://example.org/blog/feed.xml</id>")
+  )
+  should.be_true(string.contains(feed, "<id>https://example.org/old/owl</id>"))
+  should.be_true(
+    string.contains(feed, "href=\"https://example.org/blog/posts/owl/\"")
+  )
+}
+
+test "the Atom feed update clock records rebuilds independently of article dates" {
+  let root = site("feed-clock")
+  let #(_, outputs) = should.be_ok(
+    build.prepare_request(request.defaults(root), "2026-01-03")
+  )
+  loop output in outputs {
+    match output.name == "feed.xml" {
+      True -> should.be_true(
+        string.contains(output.text, "<updated>2026-01-03T00:00:00Z</updated>")
+      )
+      False -> Nil
+    }
+  }
+}

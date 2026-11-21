@@ -1,0 +1,274 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// Feeds and indexes come from the visible page catalog, never from a second
+//// filesystem walk. Drafts and future pages therefore obey the same choice as
+//// HTML. Names join publication's collision check before any output is written.
+module publishing
+
+import jinks/config
+import jinks/date
+import jinks/content
+import jinks/collection
+import jinks/route
+import marksy/html
+import pooka/json
+import pooka/list
+import pooka/string
+import pooka/uri
+import pooka/order.{Order}
+
+/// Append a generated site-relative URL beneath an optional deployment prefix.
+///
+/// ```pooka
+/// assert publishing.absolute("https://example.org/blog/", "/owl/") == "https://example.org/blog/owl/"
+/// ```
+absolute(base: String, url: String) -> String {
+  string.remove_suffix(base, "/") + url
+}
+
+validate_base(base: String) -> Result(Nil, String) {
+  let address = match uri.parse(base) {
+    Ok(address) -> Ok(address)
+    Error(_) -> Error("base-url must be an absolute HTTP(S) URL")
+  }?
+  match (address.scheme == Some("https") || address.scheme == Some("http")) && address.host != None && address.host != Some(
+    ""
+  ) && address.userinfo == None && address.query == None && address.fragment == None && !string.contains(
+    base,
+    "\n"
+  ) && !string.contains(base, "\r") {
+    True -> Ok(Nil)
+    False -> Error(
+      "base-url must be an absolute HTTP(S) URL without credentials, query or fragment"
+    )
+  }
+}
+
+prepare(
+  site: config.Config,
+  pages: List(content.Page),
+  outputs: List(String),
+  clock: String,
+  rendered: List(#(String, String))
+) -> Result(List(#(String, String)), String) {
+  let options = site.publishing
+  match options.feed || options.sitemap || options.search || options.robots {
+    False -> Ok([])
+    True -> {
+      let _ = validate_base(site.base_url)?
+      let catalog = collection.prepare(site.collections, pages)?
+      let posts = match list.key_find(catalog.groups, options.collection) {
+        Some(posts) -> Ok(posts)
+        None if options.feed -> Error(
+          "publishing.collection is not configured: " + options.collection
+        )
+        _ -> Ok([])
+      }?
+      let posts = list.sort_by(posts, fn(left, right) {
+        match string.compare(collection.day(right), collection.day(left)) {
+          Order.Equal -> string.compare(left.name, right.name)
+          order -> order
+        }
+      })
+      let dated = list.take(
+        list.filter(posts, fn(page) {
+          page.published != None
+        }),
+        options.limit
+      )
+      let feed = match options.feed {
+        True -> [#("feed.xml", match options.format {
+          "rss" -> rss(site, dated)
+          _ -> atom(site, dated, clock)
+        })]
+        False -> []
+      }
+      let sitemap = match options.sitemap {
+        True -> [#("sitemap.xml", sitemap(site, outputs))]
+        False -> []
+      }
+      let search = match options.search {
+        True -> [
+          #("search.json", json.encode(json.JArray(list.map(pages, fn(page) {
+            json.JObject([
+              #("title", json.JString(page.title)),
+              #("url", json.JString(route.url(page.output))),
+              #("content", json.JString(plain(match page.kind {
+                content.Kind.Markdown -> page.body
+                content.Kind.Template -> match list.key_find(
+                  rendered,
+                  page.output
+                ) {
+                  Some(body) -> body
+                  None -> ""
+                }
+              })))
+            ])
+          }))))
+        ]
+        False -> []
+      }
+      let robots = match options.robots {
+        True -> [
+          #("robots.txt", "User-agent: *\nAllow: /\n" + match options.sitemap {
+            True -> "Sitemap: " + absolute(site.base_url, "/sitemap.xml") + "\n"
+            False -> ""
+          })
+        ]
+        False -> []
+      }
+      Ok(list.concat(feed, list.concat(sitemap, list.concat(search, robots))))
+    }
+  }
+}
+
+/// Strip markup before exporting searchable text. Entity decoding is one pass;
+/// authored ampersands must not accidentally become a second round of markup.
+plain(source: String) -> String {
+  let state = list.fold(
+    string.split(source, ""),
+    #(False, []),
+    fn(state, char) {
+      match char {
+        "<" -> #(True, [" ", ..state.1])
+        ">" -> #(False, state.1)
+        _ if state.0 -> state
+        _ -> #(False, [char, ..state.1])
+      }
+    }
+  )
+  let text = string.join(list.reverse(state.1), "")
+  list.fold(
+    [
+      #("&lt;", "<"),
+      #("&gt;", ">"),
+      #("&quot;", "\""),
+      #("&#39;", "'"),
+      #("&amp;", "&")
+    ],
+    text,
+    fn(text, pair) {
+      string.replace(text, pair.0, pair.1)
+    }
+  )
+}
+
+atom(site: config.Config, posts: List(content.Page), updated: String) -> String {
+  let base = xml(absolute(site.base_url, "/"))
+  let feed_url = xml(absolute(site.base_url, "/feed.xml"))
+  let author = match json.get(site.params, "author") {
+    Some(json.JString(name)) -> name
+    _ -> site.title
+  }
+  let entries = list.map(posts, fn(page) {
+    let url = xml(absolute(site.base_url, route.url(page.output)))
+    let stamp = collection.day(page) + "T00:00:00Z"
+    "<entry><id>" + xml(entry_id(site, page)) + "</id><title>" + xml(page.title) + "</title><link href=\"" + url + "\"/><published>" + stamp + "</published><updated>" + stamp + "</updated><content type=\"html\">" + xml(
+      page.body
+    ) + "</content></entry>"
+  })
+  "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<feed xmlns=\"http://www.w3.org/2005/Atom\"><id>" + feed_url + "</id><title>" + xml(
+    feed_title(site)
+  ) + "</title><subtitle>" + xml(feed_description(site)) + "</subtitle><author><name>" + xml(
+    author
+  ) + "</name></author><link href=\"" + base + "\"/><link rel=\"self\" href=\"" + feed_url + "\"/><updated>" + updated + "</updated>" + string.join(
+    entries,
+    ""
+  ) + "</feed>\n"
+}
+
+entry_id(site: config.Config, page: content.Page) -> String {
+  match json.get(page.metadata, "feed_id") {
+    Some(json.JString(identifier)) -> identifier
+    _ -> absolute(site.base_url, route.url(page.output))
+  }
+}
+
+feed_title(site: config.Config) -> String {
+  match site.publishing.title {
+    Some(title) -> title
+    None -> site.title
+  }
+}
+
+feed_description(site: config.Config) -> String {
+  match site.publishing.description {
+    Some(description) -> description
+    None -> match json.get(site.params, "description") {
+      Some(json.JString(description)) -> description
+      _ -> site.title
+    }
+  }
+}
+
+sitemap(site: config.Config, outputs: List(String)) -> String {
+  let urls = list.filter(list.unique(outputs), fn(output) {
+    string.ends_with(output, ".html") && output != "404.html"
+  })
+  "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">" + string.join(
+    list.map(urls, fn(output) {
+      "<url><loc>" + xml(absolute(site.base_url, route.url(output))) + "</loc></url>"
+    }),
+    ""
+  ) + "</urlset>\n"
+}
+
+rss(site: config.Config, posts: List(content.Page)) -> String {
+  let base = xml(absolute(site.base_url, "/"))
+  let items = list.map(posts, fn(page) {
+    let published = match date.rfc822(collection.day(page)) {
+      Ok(stamp) -> "<pubDate>" + stamp + "</pubDate>"
+      Error(_) -> ""
+    }
+    let url = xml(absolute(site.base_url, route.url(page.output)))
+    let identifier = entry_id(site, page)
+    let permalink = match string.starts_with(identifier, "https://") || string.starts_with(
+      identifier,
+      "http://"
+    ) {
+      True -> "true"
+      False -> "false"
+    }
+    "<item><title>" + xml(page.title) + "</title><link>" + url + "</link><guid isPermaLink=\"" + permalink + "\">" + xml(
+      identifier
+    ) + "</guid><description>" + xml(page.body) + "</description>" + published + "</item>"
+  })
+  "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<rss version=\"2.0\"><channel><title>" + xml(
+    feed_title(site)
+  ) + "</title><link>" + base + "</link><description>" + xml(
+    feed_description(site)
+  ) + "</description>" + string.join(items, "") + "</channel></rss>\n"
+}
+
+names(site: config.Config) -> List(String) {
+  list.filter_map(
+    [
+      #(site.publishing.feed, "feed.xml"),
+      #(site.publishing.sitemap, "sitemap.xml"),
+      #(site.publishing.search, "search.json"),
+      #(site.publishing.robots, "robots.txt")
+    ],
+    fn(entry) {
+      match entry.0 {
+        True -> Some(entry.1)
+        False -> None
+      }
+    }
+  )
+}
+
+/// XML 1.0 excludes a few otherwise valid Unicode scalars. Drop those before
+/// escaping so one pasted control character cannot break an entire feed.
+xml(source: String) -> String {
+  let clean = string.split(source, "") |> list.filter(fn(char) {
+    match list.first(string.to_list(char)) {
+      Some(code) -> code == 9 || code == 10 || code == 13 || (
+        code >= 32 && code <= 55295
+      ) || (code >= 57344 && code <= 65533) || (
+        code >= 65536 && code <= 1114111
+      )
+      None -> False
+    }
+  }) |> string.join("")
+  html.escape(clean)
+}

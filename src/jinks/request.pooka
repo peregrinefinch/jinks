@@ -1,0 +1,126 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// A build request holds temporary command-line choices. It never rewrites
+//// the author's configuration. The selected configuration file is the anchor
+//// for every source/output path, even when the command starts elsewhere.
+module request
+
+import jinks/config
+import jinks/provider
+import jinks/boundary
+import jinks/storage
+import pooka/path
+
+class Request(
+  root: String,
+  file: String,
+  output: Option(String),
+  base_url: Option(String),
+  drafts: Bool,
+  future: Bool,
+  environment: Option(String),
+  providers: List(provider.Provider)
+)
+
+defaults(root: String) -> Request {
+  Request(root, "config.toml", None, None, False, False, None, [])
+}
+
+select(
+  root: String,
+  filename: String,
+  output: Option(String),
+  base_url: Option(String),
+  drafts: Bool,
+  future: Bool
+) -> Result(Request, String) {
+  let chosen = match path.is_absolute(filename) {
+    True -> filename
+    False -> path.join([root, filename])
+  }
+  let chosen = match path.absolute(chosen) {
+    Ok(chosen) -> Ok(path.normalize(chosen))
+    Error(e) -> Error(e.message)
+  }?
+  let root = path.dirname(chosen)
+  let file = path.basename(chosen)
+  let _ = config.relative(file)?
+  let _ = match output {
+    Some(value) -> config.output_path(value)
+    None -> Ok(Nil)
+  }?
+  Ok(Request(root, file, output, base_url, drafts, future, None, []))
+}
+
+load(selected: Request) -> Result(config.Config, String) {
+  let _ = config.relative(selected.file)?
+  let _ = boundary.guard(selected.root, selected.file)?
+  let site = config.parse(
+    storage.read(path.join([selected.root, selected.file]))?
+  )?
+  let output = match selected.output {
+    Some(value) -> value
+    None -> site.output
+  }
+  let _ = config.output_path(output)?
+  let base_url = match selected.base_url {
+    Some(value) -> value
+    None -> site.base_url
+  }
+  Ok(
+    config.Config(
+      site.title,
+      base_url,
+      site.theme,
+      output,
+      site.params,
+      site.server,
+      site.collections,
+      config.BuildOptions(
+        site.build.drafts || selected.drafts,
+        site.build.future || selected.future,
+        match selected.environment {
+          Some(environment) -> environment
+          None -> site.build.environment
+        }
+      ),
+      site.listings,
+      site.publishing,
+      site.raw_html
+    )
+  )
+}
+
+with_environment(selected: Request, environment: String) -> Result(
+  Request,
+  String
+) {
+  match environment == "production" || environment == "development" {
+    False -> Error("environment must be development or production")
+    True -> Ok(
+      Request(
+        selected.root,
+        selected.file,
+        selected.output,
+        selected.base_url,
+        selected.drafts,
+        selected.future,
+        Some(environment),
+        selected.providers
+      )
+    )
+  }
+}
+
+with_providers(selected: Request, providers: List(provider.Provider)) -> Request {
+  Request(
+    selected.root,
+    selected.file,
+    selected.output,
+    selected.base_url,
+    selected.drafts,
+    selected.future,
+    selected.environment,
+    providers
+  )
+}

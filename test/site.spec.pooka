@@ -1,0 +1,141 @@
+// SPDX-License-Identifier: Apache-2.0
+module site_test
+
+import jinks/build
+import jinks/scaffold
+import jinks/storage
+import jinks/theme
+import poke/should
+import pooka/file
+import pooka/int
+import pooka/path
+import pooka/process
+import pooka/string
+
+// Every test has its own source tree; nothing reaches either real website.
+site(name: String) -> String {
+  "build/jinks-tests/" + int.to_string(process.pid()) + "/" + name
+}
+
+create(name: String) -> String {
+  let root = site(name)
+  let _ = should.be_ok(scaffold.create(root))
+  root
+}
+
+test "init creates config.toml and a separate theme.toml without overwriting" {
+  let root = create("init")
+  should.be_true(should.be_ok(file.is_file(path.join([root, "config.toml"]))))
+  should.be_true(
+    should.be_ok(file.is_file(path.join([root, "themes/minimal/theme.toml"])))
+  )
+  let _ = should.be_error(scaffold.create(root))
+}
+
+test "check renders without writing and build writes a complete home page" {
+  let root = create("build")
+  let _ = should.be_ok(build.prepare(root))
+  should.be_false(should.be_ok(file.exists(path.join([root, "public"]))))
+  should.equal(should.be_ok(build.run(root)), 1)
+  let html = should.be_ok(storage.read(path.join([root, "public/index.html"])))
+  should.be_true(
+    string.contains(html, "<h1 id=\"a-small-beginning\">A small beginning</h1>")
+  )
+}
+
+test "site layouts override theme layouts and partials" {
+  let root = create("overrides")
+  let _ = should.be_ok(
+    storage.write(
+      path.join([root, "layouts/page.html.tuck"]),
+      "{% include \"card.html.tuck\" %}{{ content | safe }}"
+    )
+  )
+  let _ = should.be_ok(
+    storage.write(path.join([root, "layouts/card.html.tuck"]), "A local card")
+  )
+  let _ = should.be_ok(build.run(root))
+  let html = should.be_ok(storage.read(path.join([root, "public/index.html"])))
+  should.be_true(string.starts_with(html, "A local card"))
+}
+
+test "duplicate routes are rejected before writing output" {
+  let root = create("collision")
+  let _ = should.be_ok(
+    storage.write(path.join([root, "content/owl.md"]), "# Owl")
+  )
+  let _ = should.be_ok(
+    storage.write(path.join([root, "content/owl/index.md"]), "# Another owl")
+  )
+  let error = should.be_error(build.run(root))
+  should.be_true(string.contains(error, "two pages"))
+  should.be_false(should.be_ok(file.exists(path.join([root, "public"]))))
+}
+
+test "a bad template preserves the last successfully rendered page" {
+  let root = create("failure")
+  let _ = should.be_ok(build.run(root))
+  let before = should.be_ok(
+    storage.read(path.join([root, "public/index.html"]))
+  )
+  let _ = should.be_ok(
+    storage.write(path.join([root, "layouts/page.html.tuck"]), "{% if %}")
+  )
+  let _ = should.be_error(build.run(root))
+  should.equal(
+    should.be_ok(storage.read(path.join([root, "public/index.html"]))),
+    before
+  )
+}
+
+test "site assets override theme assets without changing binary bytes" {
+  let root = create("assets")
+  let _ = should.be_ok(
+    storage.write(path.join([root, "themes/minimal/static/app.css"]), "theme")
+  )
+  let _ = should.be_ok(
+    storage.write(path.join([root, "static/app.css"]), "site")
+  )
+  let bytes = <<0, 255, 10, 128>>
+  let _ = should.be_ok(
+    file.write_bytes(path.join([root, "static/icon.bin"]), bytes)
+  )
+  let _ = should.be_ok(build.run(root))
+  should.equal(
+    should.be_ok(storage.read(path.join([root, "public/app.css"]))),
+    "site"
+  )
+  should.equal(
+    should.be_ok(file.read_bytes(path.join([root, "public/icon.bin"]))),
+    bytes
+  )
+}
+
+test "static files cannot overwrite pages" {
+  let root = create("asset-collision")
+  let _ = should.be_ok(
+    storage.write(path.join([root, "static/index.html"]), "other")
+  )
+  let _ = should.be_error(build.run(root))
+  should.be_false(should.be_ok(file.exists(path.join([root, "public"]))))
+}
+
+test "draft pages are not emitted" {
+  let root = create("drafts")
+  let _ = should.be_ok(
+    storage.write(
+      path.join([root, "content/secret.md"]),
+      "---\ndraft = true\n---\n# Secret"
+    )
+  )
+  should.equal(should.be_ok(build.run(root)), 1)
+  should.be_false(
+    should.be_ok(file.exists(path.join([root, "public/secret/index.html"])))
+  )
+}
+
+test "theme metadata validates its own fields" {
+  let _ = should.be_error(theme.parse(""))
+  let _ = should.be_error(theme.parse("name = 42"))
+  should.equal(should.be_ok(theme.parse("name = \"quiet\"")).name, "quiet")
+}

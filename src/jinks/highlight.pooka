@@ -1,0 +1,236 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// A small build-time colourist, not a second compiler. Token spelling is
+//// always escaped before entering a span; an unknown language stays plain.
+//// Lists of fragments keep a long code block from repeatedly copying itself.
+module highlight
+
+import marksy/html
+import pooka/list
+import pooka/string
+
+span(kind: String, text: String) -> String {
+  "<span class=\"tok-" + kind + "\">" + html.escape(text) + "</span>"
+}
+
+render(source: String, language: String) -> String {
+  match language == "tree" || (
+    (language == "text" || language == "") && is_tree(source)
+  ) {
+    True -> string.split(source, "\n") |> list.map(tree_line) |> string.join(
+      "\n"
+    )
+    False -> code(source, language)
+  }
+}
+
+code(source: String, language: String) -> String {
+  match list.contains(
+    [
+      "pooka",
+      "gleam",
+      "erlang",
+      "erl",
+      "lfe",
+      "lisp",
+      "elixir",
+      "ex",
+      "toml",
+      "sh",
+      "shell",
+      "bash",
+      "javascript",
+      "js",
+      "json",
+      "css",
+      "html",
+      "sql"
+    ],
+    language
+  ) {
+    True -> scan(string.split(source, ""), language, []) |> list.reverse() |> string.join(
+      ""
+    )
+    False -> match language == "snapshot" || language == "terminal" || (
+      (language == "text" || language == "") && (
+        string.contains(source, "✓") || string.contains(source, "✗") || string.contains(
+          source,
+          "$ "
+        )
+      )
+    ) {
+      True -> string.split(source, "\n") |> list.map(terminal) |> string.join(
+        "\n"
+      )
+      False -> html.escape(source)
+    }
+  }
+}
+
+scan(chars: List(String), language: String, done: List(String)) -> List(String) {
+  match chars {
+    [] -> done
+    ["/", "/", ..rest] if language != "toml" && language != "sh" && language != "shell" && language != "bash" -> {
+      let #(body, rest) = until_line(rest, [])
+      scan(rest, language, [span("comment", "//" + body), ..done])
+    }
+    ["#", ..rest] if list.contains(
+      ["toml", "sh", "shell", "bash", "elixir", "ex"],
+      language
+    ) -> {
+      let #(body, rest) = until_line(rest, [])
+      scan(rest, language, [span("comment", "#" + body), ..done])
+    }
+    [";", ..rest] if language == "lfe" || language == "lisp" -> {
+      let #(body, rest) = until_line(rest, [])
+      scan(rest, language, [span("comment", ";" + body), ..done])
+    }
+    ["%", ..rest] if language == "erlang" || language == "erl" -> {
+      let #(body, rest) = until_line(rest, [])
+      scan(rest, language, [span("comment", "%" + body), ..done])
+    }
+    [quote, ..rest] if quote == "\"" || quote == "'" -> {
+      let #(body, rest) = quoted(rest, quote, [])
+      scan(rest, language, [span("string", quote + body), ..done])
+    }
+    [char, ..rest] -> match word_char(char) {
+      True -> {
+        let #(word, rest) = word(rest, [char])
+        let kind = match list.contains(
+          string.split(
+            "module import class enum interface actor external native from is with be var let new self super match if fn loop in test assert as panic todo echo True False Nil skip pub type opaque const use case of when receive after fun end begin try catch def defp defmodule do else true false nil and or not div rem defun defmodule defmacro lambda SELECT FROM WHERE INSERT INTO VALUES RETURNING CREATE TABLE",
+            " "
+          ),
+          word
+        ) {
+          True -> "keyword"
+          False -> match string.contains("0123456789", char) {
+            True -> "number"
+            False -> match rest {
+              ["(", ..] -> "function"
+              _ if string.contains("ABCDEFGHIJKLMNOPQRSTUVWXYZ", char) -> "type"
+              _ -> "name"
+            }
+          }
+        }
+        scan(rest, language, [span(kind, word), ..done])
+      }
+      False -> scan(rest, language, [html.escape(char), ..done])
+    }
+  }
+}
+
+word_char(char: String) -> Bool {
+  (
+    string.contains("abcdefghijklmnopqrstuvwxyz", char)
+  ) || (string.contains("ABCDEFGHIJKLMNOPQRSTUVWXYZ", char)) || (
+    string.contains("0123456789", char)
+  ) || char == "_"
+}
+
+word(chars: List(String), done: List(String)) -> #(String, List(String)) {
+  match chars {
+    [char, ..rest] if word_char(char) -> word(rest, [char, ..done])
+    _ -> #(list.reverse(done) |> string.join(""), chars)
+  }
+}
+
+until_line(chars: List(String), done: List(String)) -> #(String, List(String)) {
+  match chars {
+    [] -> #(list.reverse(done) |> string.join(""), [])
+    ["\n", ..] -> #(list.reverse(done) |> string.join(""), chars)
+    [char, ..rest] -> until_line(rest, [char, ..done])
+  }
+}
+
+quoted(chars: List(String), quote: String, done: List(String)) -> #(
+  String,
+  List(String)
+) {
+  match chars {
+    [] -> #(list.reverse(done) |> string.join(""), [])
+    ["\\", next, ..rest] -> quoted(rest, quote, [next, "\\", ..done])
+    [char, ..rest] if char == quote -> #(
+      list.reverse([char, ..done]) |> string.join(""),
+      rest
+    )
+    [char, ..rest] -> quoted(rest, quote, [char, ..done])
+  }
+}
+
+terminal(line: String) -> String {
+  let text = string.trim(line)
+  let kind = match True {
+    _ if string.starts_with(text, "✓") -> "pass"
+    _ if string.starts_with(text, "✗") || string.starts_with(text, "error:") -> "fail"
+    _ if string.starts_with(text, "+ ") || string.contains(text, " + ") -> "diff-add"
+    _ if string.starts_with(text, "- ") || string.contains(text, " - ") -> "diff-remove"
+    _ if string.starts_with(text, "expected") -> "violet"
+    _ if string.starts_with(text, "got ") -> "fail"
+    _ if string.starts_with(text, "•") || string.starts_with(text, "Running") || string.starts_with(
+      text,
+      "Finished"
+    ) -> "label"
+    _ -> "dim"
+  }
+  "<span class=\"t-" + kind + "\">" + html.escape(line) + "</span>"
+}
+
+/// A plain fence becomes a tree only when every nonempty row looks like a
+/// portable filename and at least one directory is present. Ordinary prose
+/// and unknown language fences keep their literal spelling.
+is_tree(source: String) -> Bool {
+  let rows = list.filter(string.split(source, "\n"), fn(line) {
+    string.trim(line) != ""
+  })
+  !list.is_empty(rows) && list.any(rows, fn(line) {
+    string.contains(line, "/")
+  }) && list.all(rows, fn(line) {
+    let #(name, note) = tree_name(string.split(string.trim_start(line), ""), [])
+    name != "" && (
+      note == "" || string.starts_with(note, "  ") || string.starts_with(
+        note,
+        "\t"
+      )
+    ) && list.all(string.split(name, ""), fn(char) {
+      word_char(char) || list.contains([".", "@", "-", "/"], char)
+    })
+  })
+}
+
+tree_name(chars: List(String), found: List(String)) -> #(String, String) {
+  match chars {
+    [] -> #(string.join(list.reverse(found), ""), "")
+    [char, ..rest] if char == " " || char == "\t" -> #(
+      string.join(list.reverse(found), ""),
+      string.join(chars, "")
+    )
+    [char, ..rest] -> tree_name(rest, [char, ..found])
+  }
+}
+
+tree_line(line: String) -> String {
+  let trimmed = string.trim_start(line)
+  let indent = string.slice(
+    line,
+    0,
+    string.length(line) - string.length(trimmed)
+  )
+  let #(name, note) = tree_name(string.split(trimmed, ""), [])
+  let parts = string.split(name, "/")
+  let shown = match name {
+    "..." -> "<span class=\"t-dim\">...</span>"
+    _ if list.length(parts) > 1 -> {
+      let prefix = string.join(list.take(parts, list.length(parts) - 1), "/") + "/"
+      let leaf = string.join(list.drop(parts, list.length(parts) - 1), "")
+      "<span class=\"t-dir\">" + html.escape(prefix) + "</span>" + html.escape(
+        leaf
+      )
+    }
+    _ -> html.escape(name)
+  }
+  html.escape(indent) + shown + match note {
+    "" -> ""
+    _ -> "<span class=\"t-dim\">" + html.escape(note) + "</span>"
+  }
+}

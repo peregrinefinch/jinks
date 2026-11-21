@@ -1,0 +1,357 @@
+// SPDX-License-Identifier: Apache-2.0
+module watch_test
+
+import jinks/scaffold
+import jinks/serve
+import jinks/server
+import jinks/storage
+import jinks/watch
+import poke/should
+import pooka/file
+import pooka/httpc
+import pooka/int
+import pooka/json
+import pooka/path
+import pooka/process
+import pooka/string
+
+with_watch(name: String, work: fn(watch.State) -> Nil) {
+  let root = "build/jinks-watch/" + int.to_string(process.pid()) + "/" + name
+  let _ = should.be_ok(scaffold.create(root))
+  let state = should.be_ok(watch.start(root, "127.0.0.1", 0, True))
+  let result = should.attempt(fn() { work(state) })
+  let _ = should.be_ok(server.stop(state.server))
+  let _ = should.be_ok(result)
+  Nil
+}
+
+write(state: watch.State, name: String, source: String) {
+  let _ = should.be_ok(storage.write(path.join([state.root, name]), source))
+  Nil
+}
+
+page(state: watch.State) -> String {
+  let reply = should.be_ok(
+    httpc.get("http://127.0.0.1:" + int.to_string(state.server.port) + "/")
+  )
+  should.be_ok(reply.text())
+}
+
+status(state: watch.State) -> json.Json {
+  let reply = should.be_ok(
+    httpc.get(
+      "http://127.0.0.1:" + int.to_string(state.server.port) + "/__jinks/status"
+    )
+  )
+  should.be_ok(json.decode(should.be_ok(reply.text())))
+}
+
+settle(state: watch.State) -> watch.State {
+  should.be_ok(watch.tick(should.be_ok(watch.tick(state))))
+}
+
+test "watch snapshots ignore output and detect same-length source edits" {
+  with_watch("fingerprint", fn(state) {
+    let before = should.be_ok(watch.snapshot(state.root))
+    write(state, "public/ignored.txt", "not an input")
+    should.equal(should.be_ok(watch.snapshot(state.root)), before)
+    write(state, "content/index.md", "# Cat")
+    let cat = should.be_ok(watch.snapshot(state.root))
+    write(state, "content/index.md", "# Owl")
+    should.not_equal(should.be_ok(watch.snapshot(state.root)), cat)
+  })
+}
+
+test "two stable observations debounce saves and hot reload a template" {
+  with_watch("template", fn(state) {
+    write(state, "layouts/page.html.tuck", "<h1>First draft</h1>")
+    let pending = should.be_ok(watch.tick(state))
+    should.equal(pending.revision, 0)
+    write(state, "layouts/page.html.tuck", "<h1>Final draft</h1>")
+    let changed = should.be_ok(watch.tick(pending))
+    should.equal(changed.revision, 0)
+    let ready = should.be_ok(watch.tick(changed))
+    should.equal(ready.revision, 1)
+    should.be_true(string.contains(page(ready), "Final draft"))
+    should.equal(json.get(status(ready), "revision"), Some(json.JInt(1)))
+    should.equal(should.be_ok(watch.tick(ready)).revision, 1)
+  })
+}
+
+test "a broken template keeps old HTML and its error remains until a real fix" {
+  with_watch("failure", fn(state) {
+    let before = page(state)
+    write(state, "layouts/page.html.tuck", "{% if %}")
+    let broken = settle(state)
+    should.equal(broken.revision, 0)
+    should.not_equal(broken.problem, "")
+    should.equal(page(broken), before)
+    let unchanged = should.be_ok(watch.tick(broken))
+    should.equal(unchanged.problem, broken.problem)
+    should.equal(
+      json.get(status(unchanged), "error"),
+      Some(json.JString(broken.problem))
+    )
+    write(state, "layouts/page.html.tuck", "<p>A repaired page</p>")
+    let fixed = settle(unchanged)
+    should.equal(fixed.revision, 1)
+    should.equal(fixed.problem, "")
+    should.be_true(string.contains(page(fixed), "A repaired page"))
+    should.equal(json.get(status(fixed), "error"), Some(json.JString("")))
+  })
+}
+
+test "configuration changes can retarget output after a successful build" {
+  with_watch("retarget", fn(state) {
+    write(
+      state,
+      "config.toml",
+      "title = \"A new jinks\"\noutput-dir = \"preview\"\n"
+    )
+    let changed = settle(state)
+    should.be_true(string.ends_with(changed.server.output, "/preview"))
+    should.be_true(string.contains(page(changed), "A new jinks"))
+    should.be_true(
+      should.be_ok(file.is_file(path.join([state.root, "preview/index.html"])))
+    )
+  })
+}
+
+test "deleting content removes its stale output after a watched rebuild" {
+  with_watch("deleted", fn(state) {
+    write(state, "content/owl.md", "# Owl")
+    let added = settle(state)
+    should.be_true(
+      should.be_ok(
+        file.is_file(path.join([state.root, "public/owl/index.html"]))
+      )
+    )
+    let _ = should.be_ok(file.delete(path.join([state.root, "content/owl.md"])))
+    let removed = settle(added)
+    should.equal(removed.revision, 2)
+    should.be_false(
+      should.be_ok(
+        file.exists(path.join([state.root, "public/owl/index.html"]))
+      )
+    )
+  })
+}
+
+test "a missing configuration keeps the old site and recovery clears its error" {
+  with_watch("missing-config", fn(state) {
+    let before_disk = should.be_ok(
+      storage.read(path.join([state.root, "public/index.html"]))
+    )
+    let original = should.be_ok(
+      storage.read(path.join([state.root, "config.toml"]))
+    )
+    let before = page(state)
+    let _ = should.be_ok(file.delete(path.join([state.root, "config.toml"])))
+    let missing = should.be_ok(watch.tick(state))
+    should.not_equal(missing.problem, "")
+    should.equal(page(missing), before)
+    write(state, "config.toml", original)
+    let fixed = settle(missing)
+    should.equal(fixed.problem, "")
+    should.equal(fixed.revision, 1)
+    should.equal(
+      should.be_ok(storage.read(path.join([state.root, "public/index.html"]))),
+      before_disk
+    )
+  })
+}
+
+test "local data and theme defaults participate in watched rebuilds" {
+  with_watch("theme-data", fn(state) {
+    write(
+      state,
+      "themes/minimal/theme.toml",
+      "name = \"minimal\"\n[params]\nlabel = \"Workshop\""
+    )
+    write(state, "data/menu.toml", "title = \"First\"")
+    write(
+      state,
+      "layouts/page.html.tuck",
+      "{{ site.params.label }} {{ data.menu.title }}"
+    )
+    let first = settle(state)
+    should.be_true(string.contains(page(first), "Workshop First"))
+    write(state, "data/menu.toml", "title = \"Second\"")
+    let second = settle(first)
+    should.equal(second.revision, 2)
+    should.be_true(string.contains(page(second), "Workshop Second"))
+    write(
+      state,
+      "themes/minimal/theme.toml",
+      "name = \"minimal\"\n[params]\nlabel = \"Library\""
+    )
+    let third = settle(second)
+    should.equal(third.revision, 3)
+    should.be_true(string.contains(page(third), "Library Second"))
+  })
+}
+
+test "watching a selected config preserves CLI choices through rebuilds" {
+  let root = "build/jinks-watch/" + int.to_string(process.pid()) + "/selected-config"
+  let _ = should.be_ok(scaffold.create(root))
+  let _ = should.be_ok(
+    file.rename(
+      path.join([root, "config.toml"]),
+      path.join([root, "site.toml"])
+    )
+  )
+  let _ = should.be_ok(
+    storage.write(
+      path.join([root, "layouts/page.html.tuck"]),
+      "{{ site.title }} {{ site.base_url }}"
+    )
+  )
+  let _ = should.be_ok(
+    storage.write(
+      path.join([root, "content/draft.md"]),
+      "---\ndraft = true\n---\nDraft"
+    )
+  )
+  let options = should.be_ok(
+    serve.parse(
+      [
+        root,
+        "--config",
+        "site.toml",
+        "--output",
+        "preview",
+        "--base-url",
+        "https://example.org/",
+        "--drafts",
+        "--future",
+        "--port",
+        "0"
+      ]
+    )
+  )
+  let state = should.be_ok(
+    watch.start_selected(
+      options.selected,
+      options.host,
+      options.port,
+      options.live
+    )
+  )
+  let result = should.attempt(fn() {
+    should.be_true(
+      should.be_ok(file.is_file(path.join([root, "preview/draft/index.html"])))
+    )
+    write(state, "site.toml", "title = \"Changed\"\noutput-dir = \"other\"\n")
+    let changed = settle(state)
+    should.equal(changed.revision, 1)
+    should.be_true(
+      string.contains(page(changed), "Changed https://example.org/")
+    )
+    should.be_true(
+      should.be_ok(file.is_file(path.join([root, "preview/draft/index.html"])))
+    )
+    should.be_false(should.be_ok(file.exists(path.join([root, "other"]))))
+    should.be_false(should.be_ok(file.exists(path.join([root, "public"]))))
+    Nil
+  })
+  let _ = should.be_ok(server.stop(state.server))
+  let _ = should.be_ok(result)
+}
+
+test "watched edits create and remove generated tag pages without restarting the server" {
+  with_watch("generated-listings", fn(state) {
+    write(
+      state,
+      "config.toml",
+      "[collections.posts]\narchive = \"/notes/\"\n[tags]\ncollection = \"posts\"\nindex = \"/topics/\"\n"
+    )
+    write(
+      state,
+      "content/posts/one.md",
+      "---\ntitle = \"One\"\ntags = [\"pooka\"]\n---\nHello"
+    )
+    let added = settle(state)
+    let base = "http://127.0.0.1:" + int.to_string(added.server.port)
+    let archive = should.be_ok(httpc.get(base + "/notes/"))
+    should.equal(archive.status, 200)
+    should.be_true(string.contains(should.be_ok(archive.text()), "One"))
+    should.equal(should.be_ok(httpc.get(base + "/tag/pooka/")).status, 200)
+    let _ = should.be_ok(
+      file.delete(path.join([state.root, "content/posts/one.md"]))
+    )
+    let removed = settle(added)
+    should.equal(removed.revision, 2)
+    should.equal(should.be_ok(httpc.get(base + "/tag/pooka/")).status, 404)
+    let topics = should.be_ok(httpc.get(base + "/topics/"))
+    should.be_true(string.contains(should.be_ok(topics.text()), "No tags yet."))
+  })
+}
+
+test "only existing static CSS edits qualify for in-place refresh" {
+  let before = [#("static/site.css", <<1>>), #("content/index.md", <<2>>)]
+  let after = [#("static/site.css", <<3>>), #("content/index.md", <<2>>)]
+  should.be_true(watch.css_only(before, after))
+  should.be_false(watch.css_only(before, before))
+  should.be_false(watch.css_only([], after))
+  should.be_false(watch.css_only(before, []))
+  should.be_false(
+    watch.css_only(
+      before,
+      [#("static/site.css", <<3>>), #("content/index.md", <<4>>)]
+    )
+  )
+  should.be_false(
+    watch.css_only(
+      [#("content/page.css", <<1>>)],
+      [#("content/page.css", <<2>>)]
+    )
+  )
+  should.be_true(
+    watch.css_only(
+      [#("themes/minimal/static/style.css", <<1>>)],
+      [#("themes/minimal/static/style.css", <<2>>)]
+    )
+  )
+}
+
+test "CSS changes publish new bytes with a stylesheet event while content edits reload" {
+  with_watch("css-refresh", fn(state) {
+    write(state, "static/site.css", "body { color: red }")
+    let added = settle(state)
+    should.equal(
+      json.get(status(added), "styles_only"),
+      Some(json.JBool(False))
+    )
+    write(added, "static/site.css", "body { color: blue }")
+    let edited = settle(added)
+    should.equal(edited.revision, added.revision + 1)
+    should.equal(
+      json.get(status(edited), "styles_only"),
+      Some(json.JBool(True))
+    )
+    let reply = should.be_ok(
+      httpc.get(
+        "http://127.0.0.1:" + int.to_string(edited.server.port) + "/site.css"
+      )
+    )
+    should.equal(should.be_ok(reply.text()), "body { color: blue }")
+    write(edited, "content/index.md", "# A different page")
+    let content = settle(edited)
+    should.equal(
+      json.get(status(content), "styles_only"),
+      Some(json.JBool(False))
+    )
+  })
+}
+
+test "base-url path edits retarget the preview without exposing another mount" {
+  with_watch("changed-mount", fn(state) {
+    write(state, "config.toml", "base-url = \"https://example.org/blog/\"\n")
+    let changed = settle(state)
+    should.equal(changed.server.mount, "blog")
+    let base = "http://127.0.0.1:" + int.to_string(changed.server.port)
+    should.equal(should.be_ok(httpc.get(base + "/blog/")).status, 200)
+    should.equal(should.be_ok(httpc.get(base + "/")).status, 404)
+    should.equal(should.be_ok(httpc.get(base + "/__jinks/status")).status, 200)
+  })
+}

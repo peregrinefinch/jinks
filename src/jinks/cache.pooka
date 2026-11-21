@@ -1,0 +1,97 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// A provider's cached answer has an expiry and a version, not a claim to be
+//// permanent truth. The caller supplies time so offline tests need no clock.
+//// Cache files never become published site files or watched source inputs.
+module cache
+
+import jinks/boundary
+import jinks/config
+import jinks/storage
+import pooka/file
+import pooka/int
+import pooka/json
+import pooka/list
+import pooka/path
+import pooka/process
+import pooka/string
+
+name(key: String) -> Result(String, String) {
+  let _ = config.relative(key)?
+  match string.contains(key, "/") {
+    True -> Error("cache key must be one portable path segment")
+    False -> Ok(".jinks/cache/" + key + ".json")
+  }
+}
+
+get(root: String, key: String, now: Int) -> Result(Option(json.Json), String) {
+  let relative = name(key)?
+  let _ = boundary.guard(root, relative)?
+  let filename = path.join([root, relative])
+  match file.exists(filename) {
+    Ok(False) -> Ok(None)
+    Ok(True) -> {
+      let source = storage.read(filename)?
+      match json.decode_with_limits(source, 8388608, 64) {
+        Error(_) -> Ok(None)
+        Ok(value) -> match #(
+          json.get(value, "version"),
+          json.get(value, "expires"),
+          json.get(value, "value")
+        ) {
+          #(Some(json.JInt(1)), Some(json.JInt(expires)), Some(value)) if expires > now -> Ok(
+            Some(value)
+          )
+          _ -> Ok(None)
+        }
+      }
+    }
+    Error(error) -> Error(error.message)
+  }
+}
+
+put(root: String, key: String, now: Int, ttl: Int, value: json.Json) -> Result(
+  Nil,
+  String
+) {
+  let _ = match ttl > 0 {
+    True -> Ok(Nil)
+    False -> Error("cache TTL must be positive milliseconds")
+  }?
+  let relative = name(key)?
+  let temporary = relative + "." + int.to_string(process.pid()) + ".tmp"
+  let _ = boundary.guard(root, relative)?
+  let _ = boundary.guard(root, temporary)?
+  let text = json.encode(
+    json.JObject(
+      [
+        #("version", json.JInt(1)),
+        #("expires", json.JInt(now + ttl)),
+        #("value", value)
+      ]
+    )
+  )
+  let _ = storage.write(path.join([root, temporary]), text)?
+  match file.rename(path.join([root, temporary]), path.join([root, relative])) {
+    Ok(_) -> Ok(Nil)
+    Error(error) -> Error(error.message)
+  }
+}
+
+clear(root: String) -> Result(Nil, String) {
+  let _ = boundary.guard(root, ".jinks/cache")?
+  let folder = path.join([root, ".jinks/cache"])
+  match file.is_directory(folder) {
+    Ok(False) -> Ok(Nil)
+    Error(error) -> Error(error.message)
+    Ok(True) -> {
+      let files = storage.files(folder, "")?
+      list.try_fold(files, Nil, fn(_, name) {
+        match file.delete(path.join([folder, name])) {
+          Ok(_) -> Ok(Nil)
+          Error(error) -> Error(error.message)
+        }
+      })
+    }
+  }
+}

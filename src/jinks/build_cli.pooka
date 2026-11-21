@@ -1,0 +1,118 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// Build and check share the same selection rules. Only the final command
+//// decides whether to publish; checking with an output override still writes
+//// nothing, and asking for help does not require an existing site.
+module build_cli
+
+import arglet
+import jinks/provider
+import jinks/build
+import jinks/cache
+import jinks/request
+import jinks/publish
+
+arguments(values: List(String)) -> Result(arglet.Parsed, String) {
+  match arglet.parse(values, [
+    arglet.value("config", "c", "Configuration file"),
+    arglet.value("output", "o", "Output directory"),
+    arglet.value("base-url", "", "Site URL"),
+    arglet.value("environment", "", "Build environment"),
+    arglet.flag("drafts", "", "Include drafts"),
+    arglet.flag("future", "", "Include future publication days"),
+    arglet.flag("help", "h", "Command help")
+  ]) {
+    Ok(args) -> Ok(args)
+    Error(e) -> Error(arglet.describe(e))
+  }
+}
+
+selection(args: arglet.Parsed) -> Result(request.Request, String) {
+  let root = match args.positionals {
+    [] -> Ok(".")
+    [root] -> Ok(root)
+    _ -> Error("build/check accept only one site directory")
+  }?
+  let filename = match args.get("config") {
+    Some(value) -> value
+    None -> "config.toml"
+  }
+  let selected = request.select(
+    root,
+    filename,
+    args.get("output"),
+    args.get("base-url"),
+    args.has("drafts"),
+    args.has("future")
+  )?
+  match args.get("environment") {
+    Some(environment) -> request.with_environment(selected, environment)
+    None -> Ok(selected)
+  }
+}
+
+parse(values: List(String)) -> Result(request.Request, String) {
+  selection(arguments(values)?)
+}
+
+run(values: List(String), check: Bool) -> Result(String, String) {
+  run_with(values, check, [])
+}
+
+run_with(values: List(String), check: Bool, providers: List(provider.Provider)) -> Result(
+  String,
+  String
+) {
+  let args = arguments(values)?
+  match args.has("help") {
+    True -> Ok(help(check))
+    False -> {
+      let selected = request.with_providers(selection(args)?, providers)
+      match check {
+        True -> {
+          let _ = build.check_selected(selected)?
+          Ok("Checked " + selected.root)
+        }
+        False -> {
+          let _ = build.run_selected(selected)?
+          Ok("Built " + selected.root)
+        }
+      }
+    }
+  }
+}
+
+help(check: Bool) -> String {
+  let command = match check {
+    True -> "check"
+    False -> "build"
+  }
+  "Usage: jinks " + command + " [directory] [options]\n\n  --config, -c <file>    Select configuration (default: config.toml)\n  --output, -o <dir>     Override the generated output directory\n  --base-url <url>      Override the site URL\n  --environment <name>  development or production\n  --drafts              Include draft pages\n  --future              Include future publication days\n  --help, -h            Show command help\n\nThe config path is relative to the site directory; source/output paths are relative to that file. Check renders without publishing."
+}
+
+clean(values: List(String)) -> Result(String, String) {
+  let args = match arglet.parse(values, [
+    arglet.value("config", "c", "Configuration file"),
+    arglet.value("output", "o", "Output directory"),
+    arglet.flag("cache", "", "Also remove provider cache files"),
+    arglet.flag("help", "h", "Command help")
+  ]) {
+    Ok(args) -> Ok(args)
+    Error(e) -> Error(arglet.describe(e))
+  }?
+  match args.has("help") {
+    True -> Ok(
+      "Usage: jinks clean [directory] [--config <file>] [--output <dir>] [--cache]\nRemove manifest-owned generated files and preserve unowned files."
+    )
+    False -> {
+      let selected = selection(args)?
+      let settings = request.load(selected)?
+      let _ = publish.clean(selected.root, settings.output)?
+      let _ = match args.has("cache") {
+        True -> cache.clear(selected.root)
+        False -> Ok(Nil)
+      }?
+      Ok("Cleaned " + selected.root)
+    }
+  }
+}

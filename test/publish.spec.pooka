@@ -1,0 +1,283 @@
+// SPDX-License-Identifier: Apache-2.0
+
+module publish_test
+
+import jinks
+import jinks/boundary
+import jinks/build
+import jinks/publish
+import jinks/scaffold
+import jinks/storage
+import poke/should
+import pooka/file
+import pooka/int
+import pooka/list
+import pooka/path
+import pooka/process
+import pooka/string
+
+site(name: String) -> String {
+  let root = "build/jinks-publish/" + int.to_string(process.pid()) + "/" + name
+  let _ = should.be_ok(scaffold.create(root))
+  root
+}
+
+read(root: String, name: String) -> String {
+  should.be_ok(storage.read(path.join([root, name])))
+}
+
+write(root: String, name: String, text: String) {
+  let _ = should.be_ok(storage.write(path.join([root, name]), text))
+  Nil
+}
+
+exists(root: String, name: String) -> Bool {
+  should.be_ok(file.exists(path.join([root, name])))
+}
+
+quiet(root: String) {
+  let names = should.be_ok(file.list_directory(root))
+  should.be_false(list.any(names, fn(name) {
+    string.starts_with(name, ".jinks-stage-") || string.starts_with(
+      name,
+      ".jinks-backup-"
+    ) || name == ".jinks-build.lock"
+  }))
+}
+
+test "manifest round trips names and rejects malformed ownership" {
+  should.equal(
+    publish.decode(publish.encode(["owl/index.html", "app.css"])),
+    Ok(["app.css", "owl/index.html"])
+  )
+  loop source in [
+    "not json",
+    "{}",
+    "{\"version\":2,\"files\":[]}",
+    "{\"version\":1,\"files\":[1]}",
+    "{\"version\":1,\"files\":[\"../source\"]}",
+    "{\"version\":1,\"files\":[\".jinks-manifest.json\"]}"
+  ] {
+    let _ = should.be_error(publish.decode(source))
+  }
+}
+
+test "portable output names reject case and ancestor collisions" {
+  loop names in [
+    ["Owl/index.html", "owl/index.html"],
+    ["app", "app/css"],
+    [".JINKS-MANIFEST.JSON"],
+    ["../page"]
+  ] {
+    let _ = should.be_error(publish.validate(names))
+  }
+}
+
+test "removed pages and assets disappear while unowned binary files survive" {
+  let root = site("stale")
+  write(root, "content/owl.md", "# Owl")
+  write(root, "static/old.css", "old")
+  let _ = should.be_ok(build.run(root))
+  let bytes = <<0, 255, 128>>
+  let _ = should.be_ok(
+    file.write_bytes(path.join([root, "public/notes.bin"]), bytes)
+  )
+  let _ = should.be_ok(file.delete(path.join([root, "content/owl.md"])))
+  let _ = should.be_ok(file.delete(path.join([root, "static/old.css"])))
+  let _ = should.be_ok(build.run(root))
+  should.be_false(exists(root, "public/owl/index.html"))
+  should.be_false(exists(root, "public/old.css"))
+  should.equal(
+    should.be_ok(file.read_bytes(path.join([root, "public/notes.bin"]))),
+    bytes
+  )
+  should.equal(
+    should.be_ok(publish.decode(read(root, "public/.jinks-manifest.json"))),
+    ["index.html"]
+  )
+  quiet(root)
+}
+
+test "new generated files cannot claim an unowned output path" {
+  let root = site("unowned")
+  let _ = should.be_ok(build.run(root))
+  let before = read(root, "public/index.html")
+  write(root, "public/owl/index.html", "private notes")
+  write(root, "content/owl.md", "# Owl")
+  let error = should.be_error(build.run(root))
+  should.be_true(string.contains(error, "unowned"))
+  should.equal(read(root, "public/owl/index.html"), "private notes")
+  should.equal(read(root, "public/index.html"), before)
+  quiet(root)
+}
+
+test "a copy failure after rendering keeps all previous output and manifest" {
+  let root = site("copy-error")
+  let _ = should.be_ok(build.run(root))
+  let before = read(root, "public/index.html")
+  let manifest = read(root, "public/.jinks-manifest.json")
+  let _ = should.be_error(
+    publish.run(
+      root,
+      "public",
+      [#("index.html", "new")],
+      [#("missing.bin", path.join([root, "missing-source"]))]
+    )
+  )
+  should.equal(read(root, "public/index.html"), before)
+  should.equal(read(root, "public/.jinks-manifest.json"), manifest)
+  quiet(root)
+}
+
+test "a failed staging callback removes temporary files and releases the lock" {
+  let root = site("callback-error")
+  let _ = should.be_ok(build.run(root))
+  let before = read(root, "public/index.html")
+  let result = boundary.staged(root, "public", fn(stage, _) {
+    let _ = storage.write(path.join([stage, "index.html"]), "partial")?
+    Error("not ready")
+  })
+  should.equal(result, Error("not ready"))
+  should.equal(read(root, "public/index.html"), before)
+  quiet(root)
+  let _ = should.be_ok(build.run(root))
+}
+
+test "a damaged manifest blocks building and cleaning without deleting output" {
+  let root = site("bad-manifest")
+  let _ = should.be_ok(build.run(root))
+  let before = read(root, "public/index.html")
+  write(root, "public/.jinks-manifest.json", "broken")
+  let _ = should.be_error(build.run(root))
+  let _ = should.be_error(jinks.command(["clean", root]))
+  should.equal(read(root, "public/index.html"), before)
+  quiet(root)
+}
+
+test "clean removes generated files but leaves unowned files and source" {
+  let root = site("clean")
+  let _ = should.be_ok(build.run(root))
+  write(root, "public/notes.txt", "keep me")
+  let _ = should.be_ok(jinks.command(["clean", root]))
+  should.be_false(exists(root, "public/index.html"))
+  should.equal(read(root, "public/notes.txt"), "keep me")
+  should.be_true(exists(root, "content/index.md"))
+  should.equal(
+    publish.decode(read(root, "public/.jinks-manifest.json")),
+    Ok([])
+  )
+  let _ = should.be_ok(build.run(root))
+  should.be_true(exists(root, "public/index.html"))
+  quiet(root)
+}
+
+test "cleaning a never-built site does not create output" {
+  let root = site("clean-empty")
+  let _ = should.be_ok(jinks.command(["clean", root]))
+  should.be_false(exists(root, "public"))
+}
+
+test "an existing writer lock prevents replacement without stealing the lock" {
+  let root = site("locked")
+  let _ = should.be_ok(build.run(root))
+  let before = read(root, "public/index.html")
+  write(root, ".jinks-build.lock", "another writer")
+  let _ = should.be_error(build.run(root))
+  should.equal(read(root, ".jinks-build.lock"), "another writer")
+  should.equal(read(root, "public/index.html"), before)
+  let _ = should.be_ok(file.delete(path.join([root, ".jinks-build.lock"])))
+}
+
+test "generated file and directory shapes can change across builds" {
+  let root = site("shape")
+  let _ = should.be_ok(publish.run(root, "public", [#("asset", "flat")], []))
+  let _ = should.be_ok(
+    publish.run(root, "public", [#("asset/nested", "inside")], [])
+  )
+  should.equal(read(root, "public/asset/nested"), "inside")
+  let _ = should.be_ok(
+    publish.run(root, "public", [#("asset", "flat again")], [])
+  )
+  should.equal(read(root, "public/asset"), "flat again")
+  quiet(root)
+}
+
+test "output boundary rejects parent paths and files as directories" {
+  let root = site("boundary")
+  let _ = should.be_error(boundary.guard(root, "../escape"))
+  let _ = should.be_error(boundary.staged(root, "config.toml", fn(_, _) {
+    Ok(Nil)
+  }))
+  should.be_true(exists(root, "config.toml"))
+}
+
+test "direct publication and clean cannot target source directories" {
+  let root = site("direct-protection")
+  let source = read(root, "content/index.md")
+  loop name in ["content", "CONTENT", "themes", "static/child", ".git"] {
+    let _ = should.be_error(publish.run(root, name, [], []))
+    let _ = should.be_error(publish.clean(root, name))
+  }
+  should.equal(read(root, "content/index.md"), source)
+}
+
+// Opaque result from Erlang's fixture operation. We assert the resulting link
+// is rejected below instead of pretending file:make_symlink returns Pooka Nil.
+class _LinkReply {}
+
+external _Links from erlang "file" {
+  make_symlink(target: String, name: String) -> _LinkReply
+}
+
+link(target: String, name: String) {
+  let _ = _Links.make_symlink(target, name)
+  let error = should.be_error(boundary.tree(name))
+  should.be_true(string.contains(error, "symbolic links"))
+}
+
+test "a linked source directory is rejected without following its loop" {
+  let root = site("linked-source")
+  link(".", path.join([root, "content/loop"]))
+  let error = should.be_error(build.run(root))
+  should.be_true(string.contains(error, "symbolic links"))
+  should.be_false(exists(root, "public"))
+}
+
+test "dangling source links are rejected rather than treated as missing files" {
+  let root = site("dangling-source")
+  link("missing.md", path.join([root, "content/broken.md"]))
+  let _ = should.be_error(build.run(root))
+}
+
+test "a linked output directory cannot replace another directory" {
+  let root = site("linked-output")
+  link("content", path.join([root, "public"]))
+  let source = read(root, "content/index.md")
+  let _ = should.be_error(build.run(root))
+  let _ = should.be_error(jinks.command(["clean", root]))
+  should.equal(read(root, "content/index.md"), source)
+}
+
+test "links in an output parent are rejected before creating staging files" {
+  let root = site("linked-parent")
+  link("content", path.join([root, "output-parent"]))
+  let _ = should.be_error(publish.run(root, "output-parent/public", [], []))
+  should.be_false(exists(root, "content/public"))
+  quiet(root)
+}
+
+test "an exception in staging still releases the writer lock and preserves output" {
+  let root = site("callback-exception")
+  let _ = should.be_ok(build.run(root))
+  let before = read(root, "public/index.html")
+  let _ = should.be_error(should.attempt(fn() {
+    boundary.staged(root, "public", fn(stage, _) {
+      let _ = storage.write(path.join([stage, "index.html"]), "partial")?
+      assert False
+      Ok(Nil)
+    })
+  }))
+  should.equal(read(root, "public/index.html"), before)
+  quiet(root)
+  let _ = should.be_ok(build.run(root))
+}

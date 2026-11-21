@@ -1,0 +1,53 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// The few filesystem operations the standard library does not yet expose.
+//// Page policy stays in Pooka; this bridge checks links and stages directory
+//// publication without turning paths into shell commands.
+module boundary
+
+import jinks/config
+
+external _Filesystem from erlang "jinks_filesystem" {
+  create_file(root: String, relative: String, content: String) -> Result(
+    Nil,
+    String
+  )
+
+  guard_tree(path: String) -> Result(Nil, String)
+
+  guarded(root: String, relative: String) -> Result(Nil, String)
+
+  staged(
+    root: String,
+    relative: String,
+    work: fn(String, String) -> Result(Nil, String)
+  ) -> Result(Nil, String)
+}
+
+/// A link anywhere in an input tree is an error, including links to nowhere.
+tree(path: String) -> Result(Nil, String) {
+  _Filesystem.guard_tree(path)
+}
+
+/// Inspect every existing component below the site's root without following links.
+guard(root: String, relative: String) -> Result(Nil, String) {
+  _Filesystem.guarded(root, relative)
+}
+
+/// Publish only after the callback has filled a fresh sibling directory.
+/// A callback Error leaves the previous output in place and removes staging.
+staged(
+  root: String,
+  relative: String,
+  work: fn(String, String) -> Result(Nil, String)
+) -> Result(Nil, String) {
+  let _ = config.output_path(relative)?
+  _Filesystem.staged(root, relative, work)
+}
+
+/// Create a source file exclusively after checking every existing component.
+/// A second writer receives an error rather than truncating the first file.
+create(root: String, relative: String, content: String) -> Result(Nil, String) {
+  let _ = config.relative(relative)?
+  _Filesystem.create_file(root, relative, content)
+}

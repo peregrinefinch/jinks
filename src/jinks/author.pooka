@@ -1,0 +1,143 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// A new page starts as a draft, with its date written down rather than
+//// guessed later. This command changes source content only. It does not build
+//// the site or quietly replace a notebook that somebody has already opened.
+module author
+
+import arglet
+import jinks/boundary
+import jinks/date
+import jinks/names
+import jinks/request
+import jinks/route
+import jinks/storage
+import pooka/file
+import pooka/json
+import pooka/list
+import pooka/path
+import pooka/string
+
+/// Paths are relative to content/, not to the command's working directory.
+///
+/// ```sh
+/// jinks new posts/the-small-hours /path/to/site --title "The small hours"
+/// ```
+run(values: List(String)) -> Result(String, String) {
+  let args = match arglet.parse(values, [
+    arglet.flag("help", "h", "Command help"),
+    arglet.value("config", "c", "Configuration file"),
+    arglet.value("title", "", "Page title"),
+    arglet.value("date", "", "Publication day, YYYY-MM-DD"),
+    arglet.value("layout", "", "Explicit layout; otherwise inherit defaults")
+  ]) {
+    Ok(args) -> Ok(args)
+    Error(e) -> Error(arglet.describe(e))
+  }?
+  match args.has("help") {
+    True -> Ok(help())
+    False -> {
+      let #(name, root) = match args.positionals {
+        [name] -> Ok(#(name, "."))
+        [name, root] -> Ok(#(name, root))
+        _ -> Error("new requires a content path and at most one site directory")
+      }?
+      let filename = match args.get("config") {
+        Some(value) -> value
+        None -> "config.toml"
+      }
+      let selected = request.select(root, filename, None, None, False, False)?
+      let _ = request.load(selected)?
+      let name = filename_for(name)?
+      let title = match args.get("title") {
+        Some(title) -> title
+        None -> string.replace(
+          string.replace(path.stem(name), "-", " "),
+          "_",
+          " "
+        )
+      }
+      let day = match args.get("date") {
+        Some(day) -> day
+        None -> date.today()
+      }
+      let body = source(title, day, args.get("layout"))?
+      let _ = available(selected.root, name)?
+      let destination = "content/" + name
+      let _ = boundary.create(selected.root, destination, body)?
+      Ok("Created draft " + path.join([selected.root, destination]))
+    }
+  }
+}
+
+/// Validate before normalising or adding an extension: a parent segment must
+/// not disappear into a seemingly innocent filename. Unicode names use NFC.
+filename_for(value: String) -> Result(String, String) {
+  let value = names.canonical(value)
+  let _ = route.checked(value)?
+  match string.ends_with(string.lowercase(value), ".md") {
+    True -> Ok(value)
+    False -> match path.extension(value) {
+      None -> Ok(value + ".md")
+      Some(_) -> Error(
+        "new creates Markdown content; use a .md path or omit the extension"
+      )
+    }
+  }
+}
+
+/// JSON's quoted string encoding is also a valid TOML basic string here. It
+/// keeps quotes and backslashes in a title from becoming new metadata fields.
+/// Titles stay on one line, both in the envelope and in the Markdown heading.
+///
+/// ```pooka
+/// let assert Ok(page) = author.source("A small beginning", "2024-02-29", None)
+/// ```
+source(title: String, day: String, layout: Option(String)) -> Result(
+  String,
+  String
+) {
+  let _ = date.parse(day)?
+  let _ = match !string.is_empty(string.trim(title)) && !list.any(
+    string.to_list(title),
+    fn(c) { c < 32 || c == 127 }
+  ) {
+    True -> Ok(Nil)
+    False -> Error("title must be nonempty and contain no control characters")
+  }?
+  let layout_line = match layout {
+    None -> Ok("")
+    Some(value) -> {
+      let _ = route.checked(value)?
+      Ok("layout = " + json.encode(json.JString(value)) + "\n")
+    }
+  }?
+  Ok(
+    "---\ntitle = " + json.encode(json.JString(title)) + "\ndate = " + day + "\ndraft = true\n" + layout_line + "---\n\n# " + title + "\n\nThe page starts here.\n"
+  )
+}
+
+// Exact exclusive creation protects an existing file even if two commands run
+// together. This additional scan catches portable case/NFC aliases beforehand;
+// the workspace is trusted, as with the build's other path checks.
+available(root: String, name: String) -> Result(Nil, String) {
+  let _ = boundary.guard(root, "content/" + name)?
+  let entries = match file.exists(path.join([root, "content"])) {
+    Ok(False) -> Ok([])
+    Ok(True) -> storage.files(root, "content")
+    Error(e) -> Error(e.path + ": " + e.message)
+  }?
+  let key = comparable("content/" + name)
+  match list.any(entries, fn(entry) { comparable(entry) == key }) {
+    True -> Error("refusing to overwrite existing content: " + name)
+    False -> Ok(Nil)
+  }
+}
+
+comparable(value: String) -> String {
+  names.canonical(string.lowercase(names.canonical(value)))
+}
+
+help() -> String {
+  "Usage: jinks new <path> [directory] [options]\n\nCreate a Markdown draft under content/; omit .md if you like.\n\n  --config, -c <file>  Select configuration (default: config.toml)\n  --title <text>       Page title (default: words from the filename)\n  --date <YYYY-MM-DD>  Publication day (default: today in UTC)\n  --layout <name>      Explicit layout; otherwise inherit collection defaults\n  --help, -h          Show command help\n\nExisting files and linked paths are refused. Set draft = false when ready,\nor preview with serve --drafts. No build or deployment is performed."
+}

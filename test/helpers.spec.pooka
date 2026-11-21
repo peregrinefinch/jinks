@@ -1,0 +1,165 @@
+// SPDX-License-Identifier: Apache-2.0
+module helpers_test
+
+import jinks/build
+import jinks/date
+import jinks/seo
+import jinks/build_cli
+import jinks/config
+import jinks/helpers
+import jinks/request
+import jinks/scaffold
+import jinks/serve
+import jinks/storage
+import poke/should
+import pooka/int
+import pooka/json
+import pooka/path
+import pooka/process
+import pooka/string
+import tuck
+
+test "the template clock is injected once and typed helpers reject bad input" {
+  let site = should.be_ok(
+    config.parse("base-url = \"https://example.org/blog/\"")
+  )
+  let library = should.be_ok(
+    helpers.install(
+      tuck.library(),
+      site,
+      "2026-11-19T10:20:30Z",
+      [#("/app.css", "/blog/app.css?v=abc")]
+    )
+  )
+  let library = should.be_ok(
+    tuck.add(
+      library,
+      "page.html.tuck",
+      "{{ time.now() }} {{ time.now() }} {{ '/owl/' | relative_url }} {{ '/app.css' | asset }} {{ '2026-11-19' | long_date }}"
+    )
+  )
+  let text = should.be_ok(
+    tuck.render_named(library, "page.html.tuck", pooka_context())
+  )
+  should.equal(
+    text,
+    "2026-11-19T10:20:30Z 2026-11-19T10:20:30Z /blog/owl/ /blog/app.css?v=abc 19 November 2026"
+  )
+  let library = should.be_ok(
+    tuck.add(library, "bad.html.tuck", "{{ '/etc/passwd' | asset }}")
+  )
+  let _ = should.be_error(
+    tuck.render_named(library, "bad.html.tuck", pooka_context())
+  )
+}
+
+// An empty template context still leaves registered helper functions available.
+pooka_context() {
+  json.JObject([])
+}
+
+test "reading-time bounds and calendar formatting are deterministic" {
+  should.equal(helpers.reading_time(""), 0)
+  should.equal(helpers.reading_time("a short note"), 1)
+  should.equal(helpers.reading_time(string.repeat("word ", 201)), 2)
+  should.equal(helpers.format_date("2024-02-29", True), Ok("29 Feb 2024"))
+  let _ = should.be_error(helpers.format_date("2025-02-29", False))
+}
+
+site(label: String) -> String {
+  let root = "build/jinks-tests/" + int.to_string(process.pid()) + "/helpers-" + label
+  let _ = should.be_ok(scaffold.create(root))
+  root
+}
+
+test "asset fingerprints change with content and helpers are installed in builds" {
+  let root = site("assets")
+  let _ = should.be_ok(
+    storage.write(path.join([root, "static/app.css"]), "body{color:red}")
+  )
+  let _ = should.be_ok(
+    storage.write(
+      path.join([root, "layouts/page.html.tuck"]),
+      "{{ '/app.css' | asset }} {{ time.now() }}"
+    )
+  )
+  let #(_, first) = should.be_ok(
+    build.prepare_request(request.defaults(root), "2026-01-01")
+  )
+  let _ = should.be_ok(
+    storage.write(path.join([root, "static/app.css"]), "body{color:blue}")
+  )
+  let #(_, second) = should.be_ok(
+    build.prepare_request(request.defaults(root), "2026-01-01")
+  )
+  should.be_false(first == second)
+}
+
+test "production context is explicit and local serving always overrides it" {
+  let root = site("environment")
+  let _ = should.be_ok(
+    storage.write(
+      path.join([root, "config.toml"]),
+      "[build]\nenvironment = \"production\""
+    )
+  )
+  let _ = should.be_ok(
+    storage.write(
+      path.join([root, "layouts/page.html.tuck"]),
+      "{% if build.production %}analytics{% else %}preview{% endif %}"
+    )
+  )
+  let #(_, pages) = should.be_ok(build.prepare(root))
+  match pages {
+    [page] -> should.equal(page.text, "analytics")
+    _ -> should.fail("expected one page")
+  }
+  let options = should.be_ok(serve.parse([root]))
+  should.equal(
+    should.be_ok(request.load(options.selected)).build.environment,
+    "development"
+  )
+  let _ = should.be_error(build_cli.parse([root, "--environment", "staging"]))
+}
+
+test "injected build clocks reject invalid days signed fields and invalid times" {
+  should.equal(date.validate_timestamp("2026-11-19T23:59:59Z"), Ok(Nil))
+  loop clock in [
+    "2025-02-29T00:00:00Z",
+    "2026-11-19T24:00:00Z",
+    "2026-11-19T+1:00:00Z",
+    "2026-11-19T00:00:00+01:00"
+  ] {
+    let _ = should.be_error(date.validate_timestamp(clock))
+  }
+}
+
+test "SEO distinguishes a collection archive from an authored article" {
+  let site = should.be_ok(
+    config.parse(
+      "base-url = \"https://example.org/blog/\"\n[params]\ndescription = \"A few notes\""
+    )
+  )
+  let article = seo.context(
+    site,
+    json.JObject(
+      [
+        #("collection", json.JString("posts")),
+        #("source", json.JString("posts/owl.md")),
+        #("url", json.JString("/owl/"))
+      ]
+    )
+  )
+  should.equal(
+    json.get(article, "canonical"),
+    Some(json.JString("https://example.org/blog/owl/"))
+  )
+  should.equal(json.get(article, "article"), Some(json.JBool(True)))
+  let archive = seo.context(
+    site,
+    json.JObject(
+      [#("collection", json.JString("posts")), #("source", json.JNull())]
+    )
+  )
+  should.equal(json.get(archive, "article"), Some(json.JBool(False)))
+}

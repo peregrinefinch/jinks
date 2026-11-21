@@ -1,0 +1,182 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// HTML crosses the boundary once. Metadata remains ordinary escaped text;
+//// only an authored template chooses to trust rendered content. The shared
+//// root context also serves generated listings, without inventing source files
+//// or letting their pagination records become recursive collection members.
+module template
+
+import jinks/config
+import jinks/seo
+import jinks/content
+import jinks/collection
+import jinks/value
+import pooka/json
+import pooka/string
+import pooka/list
+import tuck
+import tuck/error.{TuckError, Pos}
+
+render(library: tuck.Library, site: config.Config, page: content.Page) -> Result(
+  String,
+  String
+) {
+  let catalog = collection.prepare(site.collections, [page])?
+  render_with(
+    library,
+    site,
+    page,
+    collection.context_for(page, catalog),
+    json.JObject([]),
+    catalog.context
+  )
+}
+
+render_with(
+  library: tuck.Library,
+  site: config.Config,
+  page: content.Page,
+  context: json.Json,
+  local_data: json.Json,
+  collections: json.Json
+) -> Result(String, String) {
+  render_context(
+    library,
+    site,
+    page,
+    context,
+    local_data,
+    collections,
+    json.JObject([])
+  )
+}
+
+render_context(
+  library: tuck.Library,
+  site: config.Config,
+  page: content.Page,
+  context: json.Json,
+  local_data: json.Json,
+  collections: json.Json,
+  extras: json.Json
+) -> Result(String, String) {
+  let root = value.merge(
+    base_context(site, context, local_data, collections),
+    extras
+  )
+  match page.kind {
+    content.Kind.Markdown -> finish(library, page, root, page.body)
+    content.Kind.Template -> {
+      let entry = "__jinks_internal/" + page.output + ".tuck"
+      let _ = match tuck.template(library, entry) {
+        Some(_) -> Error("reserved template namespace: " + entry)
+        None -> Ok(Nil)
+      }?
+      let library = match tuck.add(library, entry, page.body) {
+        Ok(library) -> Ok(library)
+        Error(error) -> Error(describe(error, page, entry))
+      }?
+      let rendered = match tuck.render_named(library, entry, root) {
+        Ok(rendered) -> Ok(rendered)
+        Error(error) -> Error(describe(error, page, entry))
+      }?
+      finish(library, page, root, rendered)
+    }
+  }
+}
+
+finish(library: tuck.Library, page: content.Page, root: json.Json, body: String) -> Result(
+  String,
+  String
+) {
+  match page.layout {
+    "" -> Ok(body)
+    chosen -> render_layout(library, chosen, value.merge(root, json.JObject([
+      #("content", json.JString(body)),
+      #("page", json.JObject([#("content", json.JString(body))]))
+    ])))
+  }
+}
+
+render_layout(library: tuck.Library, layout: String, context: json.Json) -> Result(
+  String,
+  String
+) {
+  let _ = match tuck.template(library, layout) {
+    Some(_) -> Ok(Nil)
+    None -> Error(
+      "missing layout: " + layout + " (searched site layouts/ and theme layouts/; available: " + (
+        list.map(library.templates, fn(entry) { entry.0 }) |> string.join(", ")
+      ) + ")"
+    )
+  }?
+  match tuck.render_named(library, layout, context) {
+    Ok(text) -> Ok(text)
+    Error(error) -> Error(tuck.describe(error))
+  }
+}
+
+/// Optional roots are present as null/empty values, so a shared base layout
+/// can ask whether pagination or a tag exists on any kind of page.
+base_context(
+  site: config.Config,
+  page: json.Json,
+  local_data: json.Json,
+  collections: json.Json
+) -> json.Json {
+  let params = match json.get(page, "params") {
+    Some(params) -> params
+    None -> json.JObject([])
+  }
+  let body = match json.get(page, "content") {
+    Some(json.JString(body)) -> body
+    _ -> ""
+  }
+  value.merge(page, json.JObject([
+    #(
+      "site",
+      json.JObject(
+        [
+          #("title", json.JString(site.title)),
+          #("base_url", json.JString(site.base_url)),
+          #("params", site.params)
+        ]
+      )
+    ),
+    #(
+      "build",
+      json.JObject(
+        [
+          #("environment", json.JString(site.build.environment)),
+          #("production", json.JBool(site.build.environment == "production"))
+        ]
+      )
+    ),
+    #("seo", seo.context(site, page)),
+    #("page", page),
+    #("params", params),
+    #("content", json.JString(body)),
+    #("data", local_data),
+    #("collections", collections),
+    #("taxonomies", json.JObject([#("tags", json.JArray([]))])),
+    #("paginator", json.JNull()),
+    #("tag", json.JNull()),
+    #("archive", json.JNull())
+  ]))
+}
+
+// Entry errors refer to the author's file and original front-matter offset.
+// Errors inside theme includes retain their own template name and location.
+describe(error: TuckError, page: content.Page, entry: String) -> String {
+  let message = string.replace(error.message, entry, page.name)
+  match error.template == entry {
+    True -> tuck.describe(
+      TuckError(
+        page.name,
+        Pos(error.at.line + page.body_line - 1, error.at.column),
+        message
+      )
+    )
+    False -> tuck.describe(TuckError(error.template, error.at, message))
+  }
+}

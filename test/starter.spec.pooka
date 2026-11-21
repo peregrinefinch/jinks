@@ -1,0 +1,76 @@
+// SPDX-License-Identifier: Apache-2.0
+module starter_test
+
+import jinks
+import jinks/build
+import jinks/log
+import jinks/request
+import jinks/storage
+import poke/should
+import pooka/int
+import pooka/file
+import pooka/path
+import pooka/process
+import pooka/string
+
+test "CLI init makes a linked example post and valid publication outputs" {
+  let root = "build/jinks-tests/" + int.to_string(process.pid()) + "/starter"
+  let _ = should.be_ok(jinks.command(["init", root]))
+  loop directory in [
+    "content/posts",
+    "data",
+    "layouts/partials",
+    "static/images",
+    "static/css",
+    "static/js",
+    "themes/minimal/layouts/partials",
+    "themes/minimal/static/css"
+  ] {
+    should.be_true(
+      should.be_ok(file.is_directory(path.join([root, directory])))
+    )
+  }
+  should.be_true(
+    should.be_ok(file.is_file(path.join([root, "data/navigation.toml"])))
+  )
+  should.be_true(
+    should.be_ok(
+      file.is_file(path.join([root, "themes/minimal/static/css/style.css"]))
+    )
+  )
+  should.be_false(should.be_ok(file.exists(path.join([root, "public"]))))
+  should.be_false(should.be_ok(file.exists(path.join([root, ".jinks"]))))
+  let _ = should.be_ok(build.check_selected(request.defaults(root)))
+  should.equal(should.be_ok(build.run(root)), 6)
+  let home = should.be_ok(storage.read(path.join([root, "public/index.html"])))
+  should.be_true(string.contains(home, "/posts/hello/"))
+  should.be_true(string.contains(home, "/css/style.css?v="))
+  should.be_false(string.contains(home, "<style>"))
+  let post = should.be_ok(
+    storage.read(path.join([root, "public/posts/hello/index.html"]))
+  )
+  should.be_true(string.contains(post, "tok-keyword"))
+}
+
+test "logging uses readable units and can keep output free of escapes" {
+  should.equal(log.duration(999), "999ms")
+  should.equal(log.duration(1000), "1s")
+  should.equal(log.duration(3718), "3.718s")
+  should.equal(log.success("Built site", 1000, False), "  Built site in 1s")
+  should.be_false(
+    string.contains(log.success("Built site", 2, False), "\u{1b}")
+  )
+  should.be_true(string.contains(log.success("Built site", 2, True), "\u{1b}"))
+}
+
+test "no-color does not swallow a literal title or arguments after a separator" {
+  should.equal(
+    log.arguments(["new", "post", "--title", "--no-color", "--no-color"]),
+    ["new", "post", "--title", "--no-color"]
+  )
+  should.equal(log.arguments(["--", "--no-color"]), ["--", "--no-color"])
+  should.equal(
+    jinks.command(["--no-color", "--help"]),
+    jinks.command(["--help"])
+  )
+}

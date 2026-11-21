@@ -1,0 +1,32 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// Theme settings have their own envelope. A site's output directory is
+//// not a theme setting, and a missing theme name deserves its own message.
+module theme
+
+import tome
+import pooka/int
+import jinks/value
+import pooka/json
+import jinks/config
+
+class Theme(name: String, version: String, params: json.Json)
+
+parse(source: String) -> Result(Theme, String) {
+  let doc = match tome.parse(source) {
+    Ok(doc) -> Ok(doc)
+    Error(e) -> Error("theme.toml:" + int.to_string(e.line) + ": " + e.message)
+  }?
+  let name = config.text(doc, "name", "")?
+  let version = config.text(doc, "version", "1.0.0")?
+  let params = value.params(doc)?
+  match name {
+    "" -> Error("theme.toml: name must not be empty")
+    _ -> Ok(Theme(name, version, params))
+  }
+}
+
+/// Site values override theme defaults recursively; arrays are replaced.
+apply(site: config.Config, theme: Theme) -> config.Config {
+  config.with_params(site, value.merge(theme.params, site.params))
+}

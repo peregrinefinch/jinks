@@ -1,0 +1,316 @@
+// SPDX-License-Identifier: Apache-2.0
+module listings_test
+
+import jinks/build
+import jinks/config
+import jinks/scaffold
+import jinks/storage
+import jinks/taxonomy
+import poke/should
+import poke/snapshot
+import pooka/file
+import pooka/int
+import pooka/path
+import pooka/process
+import pooka/string
+
+site(name: String) -> String {
+  let root = "build/jinks-listings/" + int.to_string(process.pid()) + "/" + name
+  let _ = should.be_ok(scaffold.create(root))
+  root
+}
+
+write(root: String, name: String, source: String) {
+  let _ = should.be_ok(storage.write(path.join([root, name]), source))
+  Nil
+}
+
+read(root: String, name: String) -> String {
+  should.be_ok(storage.read(path.join([root, "public", name])))
+}
+
+exists(root: String, name: String) -> Bool {
+  should.be_ok(file.exists(path.join([root, "public", name])))
+}
+
+post(root: String, name: String, date: String, tags: String) {
+  write(
+    root,
+    "content/posts/" + name + ".md",
+    "---\ntitle = \"" + name + "\"\ndate = " + date + "\ntags = " + tags + "\n---\n# Hello"
+  )
+}
+
+settings() -> String {
+  "[collections.posts]\npath = \"posts\"\nsort = \"date\"\ndirection = \"descending\"\narchive = \"/notes/\"\narchive-layout = \"list\"\narchive-title = \"Notes\"\npage-size = 2\n[tags]\ncollection = \"posts\"\npage-size = 2\nindex = \"/tags/\"\nindex-title = \"Topics\"\n"
+}
+
+layouts(root: String) {
+  write(
+    root,
+    "layouts/list.html.tuck",
+    "<h1>{{ page.title }}</h1>\n<ul>{% for p in paginator.items %}<li>{{ p.title }}</li>{% else %}<li>Empty</li>{% endfor %}</ul>\n<p>{{ paginator.number }}/{{ paginator.total_pages }}</p>\n{% if paginator.previous %}<a href=\"{{ paginator.previous }}\">Previous</a>{% endif %}{% if paginator.next %}<a href=\"{{ paginator.next }}\">Next</a>{% endif %}\n"
+  )
+  write(
+    root,
+    "layouts/tag.html.tuck",
+    "{{ tag.name }}:{{ tag.count }}|{% for p in paginator.items %}{{ p.title }};{% endfor %}|{{ paginator.number }}"
+  )
+  write(
+    root,
+    "layouts/tags.html.tuck",
+    "{{ page.title }}|{% for tag in paginator.items %}{{ tag.name }}:{{ tag.count }};{% endfor %}|{{ paginator.number }}"
+  )
+  Nil
+}
+
+test "listing settings validate sizes, layouts, selectors and unknown keys" {
+  loop source in [
+    "tags = false",
+    "[tags]\npage-size = 0",
+    "[tags]\nenabled = 1",
+    "[tags]\npath = \"../tag\"",
+    "[tags]\nlayout = \"\"",
+    "[tags]\ncollection = \"missing\"",
+    "[tags]\nindex = \"https://example.org/\"",
+    "[tags]\nindex = \"/%2e%2e/\"",
+    "[tags]\ntypo = true",
+    "[collections.posts]\npage-size = -1",
+    "[collections.posts]\narchive = \"/notes.html\"",
+    "[collections.posts]\narchive-layout = \"../bad\""
+  ] {
+    let _ = should.be_error(config.parse(source))
+  }
+}
+
+test "archives and tag pages reuse the configured visible collection order" {
+  let root = site("ordered")
+  write(root, "config.toml", settings())
+  layouts(root)
+  post(root, "old", "2019-01-01", "[\"pooka\"]")
+  post(root, "middle", "2020-01-01", "[\"pooka\", \"beam\"]")
+  post(root, "new", "2020-02-01", "[\"pooka\"]")
+  let _ = should.be_ok(build.run(root))
+  snapshot.snap(read(root, "notes/index.html"), "archive-first-page")
+  should.be_true(
+    string.contains(read(root, "notes/page/2/index.html"), "<li>old</li>")
+  )
+  should.equal(read(root, "tag/pooka/index.html"), "pooka:3|new;middle;|1")
+  should.equal(read(root, "tag/pooka/page/2/index.html"), "pooka:3|old;|2")
+  should.equal(read(root, "tags/index.html"), "Topics|beam:1;pooka:3;|1")
+  should.be_false(exists(root, "notes/page/1/index.html"))
+}
+
+test "empty archives render one first page and enabled empty tag indexes still exist" {
+  let root = site("empty")
+  write(root, "config.toml", settings())
+  layouts(root)
+  let _ = should.be_ok(build.run(root))
+  should.be_true(
+    string.contains(read(root, "notes/index.html"), "<li>Empty</li>")
+  )
+  should.equal(read(root, "tags/index.html"), "Topics||1")
+  should.be_false(exists(root, "tag/index.html"))
+  should.be_false(exists(root, "notes/page/2/index.html"))
+}
+
+test "archives can own the home route when no authored home claims it" {
+  let root = site("home")
+  write(
+    root,
+    "config.toml",
+    "[collections.posts]\narchive = \"/\"\npage-size = 1\n"
+  )
+  layouts(root)
+  let _ = should.be_ok(file.delete(path.join([root, "content/index.md"])))
+  post(root, "one", "2020-01-01", "[]")
+  post(root, "two", "2020-01-02", "[]")
+  let _ = should.be_ok(build.run(root))
+  should.be_true(string.contains(read(root, "index.html"), "one"))
+  should.be_true(string.contains(read(root, "page/2/index.html"), "two"))
+}
+
+test "generated routes collide before missing listing templates are rendered" {
+  let root = site("collision")
+  write(root, "config.toml", "[collections.posts]\narchive = \"/\"\n")
+  let error = should.be_error(build.run(root))
+  should.be_true(string.contains(error, "collide"))
+  should.be_false(exists(root, "index.html"))
+}
+
+test "pagination routes cannot overwrite an authored page or static file" {
+  let root = site("page-collision")
+  write(
+    root,
+    "config.toml",
+    "[collections.posts]\narchive = \"/notes/\"\npage-size = 1\n"
+  )
+  layouts(root)
+  post(root, "one", "2020-01-01", "[]")
+  post(root, "two", "2020-01-02", "[]")
+  write(root, "static/notes/page/2/index.html", "Static")
+  let _ = should.be_error(build.prepare(root))
+  should.be_false(exists(root, "index.html"))
+}
+
+test "Unicode tag slugs are normalized, portable and explicitly collision checked" {
+  should.equal(taxonomy.slug(" Café "), Ok("café"))
+  should.equal(taxonomy.slug("Cafe\u{301}"), Ok("café"))
+  should.equal(taxonomy.slug("BEAM & Pooka"), Ok("beam-pooka"))
+  let _ = should.be_error(taxonomy.slug("!!!"))
+  let _ = should.be_error(taxonomy.slug("CON"))
+  let root = site("slug-collision")
+  write(root, "config.toml", "[tags]\n")
+  post(root, "one", "2020-01-01", "[\"C++\", \"C#\"]")
+  let error = should.be_error(build.prepare(root))
+  should.be_true(string.contains(error, "tag slug collision"))
+}
+
+test "equivalent Unicode and whitespace tag labels form one group without duplicate pages" {
+  let root = site("unicode")
+  write(root, "config.toml", "[tags]\npage-size = 5\n")
+  layouts(root)
+  post(root, "one", "2020-01-01", "[\"Café\", \" Cafe\u{301} \"]")
+  let _ = should.be_ok(build.run(root))
+  should.equal(read(root, "tag/café/index.html"), "Café:1|one;|1")
+}
+
+test "article contexts expose finite tag links and global taxonomies" {
+  let root = site("contexts")
+  write(root, "config.toml", "[tags]\n")
+  layouts(root)
+  post(root, "one", "2020-01-01", "[\"beam\"]")
+  write(
+    root,
+    "layouts/page.html.tuck",
+    "{% for tag in page.tag_links %}{{ tag.name }}={{ tag.url }};{% endfor %}|{% for tag in taxonomies.tags %}{{ tag.name }}:{{ tag.count }};{% endfor %}"
+  )
+  let _ = should.be_ok(build.run(root))
+  should.equal(read(root, "posts/one/index.html"), "beam=/tag/beam/;|beam:1;")
+  should.equal(read(root, "index.html"), "|beam:1;")
+}
+
+test "draft future and out-of-collection pages do not leak into tag listings" {
+  let root = site("visibility")
+  write(root, "config.toml", settings())
+  layouts(root)
+  post(root, "visible", "2020-01-01", "[\"beam\"]")
+  write(
+    root,
+    "content/posts/draft.md",
+    "---\ndraft = true\ntags = [\"hidden\"]\n---\nDraft"
+  )
+  post(root, "future", "2099-01-01", "[\"future\"]")
+  write(root, "content/other.md", "---\ntags = [\"outside\"]\n---\nOther")
+  let _ = should.be_ok(build.run(root))
+  should.equal(read(root, "tags/index.html"), "Topics|beam:1;|1")
+  should.be_false(exists(root, "tag/hidden/index.html"))
+  should.be_false(exists(root, "tag/future/index.html"))
+  should.be_false(exists(root, "tag/outside/index.html"))
+}
+
+test "disabled tags produce no tag pages or tag index" {
+  let root = site("disabled")
+  write(root, "config.toml", "[tags]\nenabled = false\nindex = \"/tags/\"\n")
+  post(root, "one", "2020-01-01", "[\"pooka\"]")
+  let _ = should.be_ok(build.run(root))
+  should.be_false(exists(root, "tag/pooka/index.html"))
+  should.be_false(exists(root, "tags/index.html"))
+}
+
+test "tag indexes paginate and generated pages do not enter collections.all" {
+  let root = site("index-pagination")
+  write(root, "config.toml", "[tags]\nindex = \"/topics/\"\npage-size = 1\n")
+  layouts(root)
+  post(root, "one", "2020-01-01", "[\"beam\", \"pooka\", \"types\"]")
+  write(root, "layouts/page.html.tuck", "{{ collections.all | length }}")
+  let _ = should.be_ok(build.run(root))
+  should.equal(read(root, "topics/index.html"), "Tags|beam:1;|1")
+  should.equal(read(root, "topics/page/2/index.html"), "Tags|pooka:1;|2")
+  should.equal(read(root, "topics/page/3/index.html"), "Tags|types:1;|3")
+  should.equal(read(root, "index.html"), "2")
+}
+
+test "removed tags and excess pagination windows disappear through the manifest" {
+  let root = site("stale")
+  write(root, "config.toml", settings())
+  layouts(root)
+  post(root, "one", "2020-01-01", "[\"pooka\"]")
+  post(root, "two", "2020-01-02", "[\"pooka\"]")
+  post(root, "three", "2020-01-03", "[\"pooka\"]")
+  let _ = should.be_ok(build.run(root))
+  should.be_true(exists(root, "tag/pooka/page/2/index.html"))
+  let _ = should.be_ok(file.delete(path.join([root, "content/posts/two.md"])))
+  let _ = should.be_ok(file.delete(path.join([root, "content/posts/three.md"])))
+  write(
+    root,
+    "content/posts/one.md",
+    "---\ndate = 2020-01-01\ntags = [\"beam\"]\n---\nOne"
+  )
+  let _ = should.be_ok(build.run(root))
+  should.be_false(exists(root, "notes/page/2/index.html"))
+  should.be_false(exists(root, "tag/pooka/index.html"))
+  should.be_false(exists(root, "tag/pooka/page/2/index.html"))
+  should.be_true(exists(root, "tag/beam/index.html"))
+}
+
+test "generated pages supply stable fields for shared layouts" {
+  let root = site("shared-fields")
+  write(root, "config.toml", "[collections.posts]\narchive = \"/notes/\"\n")
+  write(
+    root,
+    "layouts/list.html.tuck",
+    "{{ page.kind }}|{{ page.layout }}|{{ page.draft }}|{{ page.tag_links | length }}|{{ page.order }}"
+  )
+  let _ = should.be_ok(build.run(root))
+  should.equal(
+    read(root, "notes/index.html"),
+    "archive|list.html.tuck|false|0|0"
+  )
+}
+
+test "tag control characters are rejected and collisions name both labels" {
+  let _ = should.be_error(taxonomy.slug("\nbeam"))
+  let root = site("collision-message")
+  write(root, "config.toml", "[tags]\n")
+  post(root, "one", "2020-01-01", "[\"Pooka\", \"pooka\"]")
+  let error = should.be_error(build.prepare(root))
+  should.be_true(string.contains(error, "Pooka"))
+  should.be_true(string.contains(error, "pooka"))
+  should.be_true(string.contains(error, "posts/one.md"))
+}
+
+test "the init theme renders archives tags and pagination without added layouts" {
+  let root = site("bundled-theme")
+  write(
+    root,
+    "config.toml",
+    "[collections.posts]\narchive = \"/notes/\"\npage-size = 1\n[tags]\ncollection = \"posts\"\nindex = \"/topics/\"\n"
+  )
+  post(root, "one", "2020-01-01", "[\"pooka\"]")
+  post(root, "two", "2020-01-02", "[\"pooka\"]")
+  let _ = should.be_ok(build.run(root))
+  let archive = read(root, "notes/index.html")
+  should.be_true(string.contains(archive, "aria-label=\"Pagination\""))
+  should.be_true(string.contains(archive, "aria-current=\"page\""))
+  should.be_true(string.contains(archive, "href=\"/notes/page/2/\""))
+  should.be_true(
+    string.contains(read(root, "tag/pooka/index.html"), "<h1>pooka</h1>")
+  )
+  should.be_true(
+    string.contains(read(root, "topics/index.html"), "href=\"/tag/pooka/\"")
+  )
+  should.be_true(string.contains(archive, "prefers-color-scheme:dark"))
+}
+
+test "authored overrides can replace the bundled listing layout" {
+  let root = site("bundled-override")
+  write(root, "config.toml", "[collections.posts]\narchive = \"/notes/\"\n")
+  write(
+    root,
+    "layouts/list.html.tuck",
+    "A local listing: {{ paginator.total_items }}"
+  )
+  let _ = should.be_ok(build.run(root))
+  should.equal(read(root, "notes/index.html"), "A local listing: 0")
+}

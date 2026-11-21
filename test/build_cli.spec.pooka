@@ -1,0 +1,195 @@
+// SPDX-License-Identifier: Apache-2.0
+module build_cli_test
+
+import jinks
+import jinks/build_cli
+import jinks/scaffold
+import jinks/storage
+import poke/should
+import pooka/file
+import pooka/int
+import pooka/path
+import pooka/process
+import pooka/string
+
+site(name: String) -> String {
+  let root = "build/jinks-cli/" + int.to_string(process.pid()) + "/" + name
+  let _ = should.be_ok(scaffold.create(root))
+  root
+}
+
+write(root: String, name: String, source: String) {
+  let _ = should.be_ok(storage.write(path.join([root, name]), source))
+  Nil
+}
+
+exists(root: String, name: String) -> Bool {
+  should.be_ok(file.exists(path.join([root, name])))
+}
+
+test "command help does not require a site and supports short flags" {
+  let help = should.be_ok(jinks.command(["build", "not-a-site", "--help"]))
+  should.be_true(string.contains(help, "--config"))
+  should.be_true(
+    string.contains(should.be_ok(jinks.command(["check", "-h"])), "--drafts")
+  )
+  should.be_true(
+    string.contains(should.be_ok(jinks.command(["help", "build"])), "Usage:")
+  )
+  should.be_true(string.contains(should.be_ok(jinks.command(["-h"])), "Jinks"))
+}
+
+test "build overrides output and base URL without rewriting configuration" {
+  let root = site("overrides")
+  let original = should.be_ok(storage.read(path.join([root, "config.toml"])))
+  write(root, "layouts/page.html.tuck", "{{ site.base_url }}")
+  let _ = should.be_ok(
+    jinks.command(
+      [
+        "build",
+        root,
+        "-o",
+        "preview",
+        "--base-url",
+        "https://example.org/docs/"
+      ]
+    )
+  )
+  should.equal(
+    should.be_ok(storage.read(path.join([root, "preview/index.html"]))),
+    "https://example.org/docs/"
+  )
+  should.be_false(exists(root, "public"))
+  should.equal(
+    should.be_ok(storage.read(path.join([root, "config.toml"]))),
+    original
+  )
+}
+
+test "check applies overrides but writes no output" {
+  let root = site("readonly")
+  let _ = should.be_ok(
+    jinks.command(
+      ["check", root, "--output", "preview", "--drafts", "--future"]
+    )
+  )
+  should.be_false(exists(root, "preview"))
+  should.be_false(exists(root, "public"))
+}
+
+test "configuration-relative paths select sources and output next to the chosen file" {
+  let root = site("relative-config")
+  let nested = path.join([root, "nested"])
+  let _ = should.be_ok(scaffold.create(nested))
+  let _ = should.be_ok(
+    file.rename(
+      path.join([nested, "config.toml"]),
+      path.join([nested, "site.toml"])
+    )
+  )
+  let _ = should.be_ok(
+    jinks.command(["build", root, "--config", "nested/site.toml"])
+  )
+  should.be_true(exists(nested, "public/index.html"))
+  should.be_false(exists(root, "public"))
+}
+
+test "an absolute configuration path anchors the site independently of the positional root" {
+  let root = site("absolute-config")
+  let selected = should.be_ok(path.absolute(path.join([root, "config.toml"])))
+  let _ = should.be_ok(
+    jinks.command(["build", "not-a-site", "--config", selected])
+  )
+  should.be_true(exists(root, "public/index.html"))
+}
+
+test "draft and future flags include pages absent from ordinary builds" {
+  let root = site("visibility")
+  write(root, "content/draft.md", "---\ndraft = true\n---\nDraft")
+  write(root, "content/later.md", "---\ndate = 2099-01-01\n---\nLater")
+  let _ = should.be_ok(jinks.command(["build", root]))
+  should.be_false(exists(root, "public/draft/index.html"))
+  should.be_false(exists(root, "public/later/index.html"))
+  let _ = should.be_ok(jinks.command(["build", root, "--drafts", "--future"]))
+  should.be_true(exists(root, "public/draft/index.html"))
+  should.be_true(exists(root, "public/later/index.html"))
+}
+
+test "unsafe destinations, unknown flags and missing option values fail" {
+  loop args in [
+    ["--output", "content"],
+    ["--output", "../outside"],
+    ["--output", "/tmp/out"],
+    ["--typo"],
+    ["--config"],
+    ["one", "two"]
+  ] {
+    let _ = should.be_error(build_cli.parse(args))
+  }
+}
+
+test "missing selected configuration reports its filename without output" {
+  let root = site("missing-config")
+  let error = should.be_error(
+    jinks.command(["build", root, "--config", "missing.toml"])
+  )
+  should.be_true(string.contains(error, "missing.toml"))
+  should.be_false(exists(root, "public"))
+}
+
+test "clean honors config and output choices while preserving unowned files" {
+  let root = site("clean-selection")
+  let _ = should.be_ok(
+    file.rename(
+      path.join([root, "config.toml"]),
+      path.join([root, "site.toml"])
+    )
+  )
+  let _ = should.be_ok(
+    jinks.command(
+      ["build", root, "--config", "site.toml", "--output", "preview"]
+    )
+  )
+  write(root, "preview/notes.txt", "keep me")
+  let _ = should.be_ok(
+    jinks.command(
+      ["clean", root, "--config", "site.toml", "--output", "preview"]
+    )
+  )
+  should.be_false(exists(root, "preview/index.html"))
+  should.equal(
+    should.be_ok(storage.read(path.join([root, "preview/notes.txt"]))),
+    "keep me"
+  )
+  should.be_true(exists(root, "site.toml"))
+  should.be_true(exists(root, "content/index.md"))
+}
+
+test "serve and clean help work outside a site with other positional arguments" {
+  should.be_true(
+    string.contains(
+      should.be_ok(jinks.command(["serve", "not-a-site", "--help"])),
+      "--config"
+    )
+  )
+  should.be_true(
+    string.contains(
+      should.be_ok(jinks.command(["clean", "not-a-site", "-h"])),
+      "manifest-owned"
+    )
+  )
+}
+
+test "configuration filenames and site paths can contain spaces" {
+  let root = site("site with spaces")
+  let _ = should.be_ok(
+    file.rename(
+      path.join([root, "config.toml"]),
+      path.join([root, "my settings.toml"])
+    )
+  )
+  let _ = should.be_ok(
+    jinks.command(["build", root, "--config", "my settings.toml"])
+  )
+  should.be_true(exists(root, "public/index.html"))
+}

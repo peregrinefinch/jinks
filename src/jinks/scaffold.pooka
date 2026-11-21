@@ -1,0 +1,132 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// A Jinks site starts with a page and a chair. The
+//// bundled theme already knows ordinary pages, archives, tags and pagination;
+//// enabling a listing in config.toml does not require writing its first theme.
+module scaffold
+
+import jinks/date
+import pooka/string
+import pooka/file
+import pooka/path
+import pooka/list
+import jinks/storage
+
+create(root: String) -> Result(Nil, String) {
+  let _ = match file.exists(root) {
+    Ok(True) -> Error("refusing to overwrite an existing path: " + root)
+    Ok(False) -> Ok(Nil)
+    Error(e) -> Error(e.message)
+  }?
+  let _ = list.try_fold(_files(), Nil, fn(_, entry) {
+    storage.write(path.join([root, entry.0]), entry.1)
+  })?
+  Ok(Nil)
+}
+
+_files() -> List(#(String, String)) {
+  [
+    #(
+      "config.toml",
+      "title = \"A small beginning\"\nbase-url = \"http://localhost:4000\"\ntheme = \"minimal\"\noutput-dir = \"public\"\n"
+    ),
+    #(
+      ".gitignore",
+      "/public\n/.jinks\n/.jinks-build.lock\n.jinks-stage-*\n.jinks-backup-*\n"
+    ),
+    #("themes/minimal/theme.toml", "name = \"minimal\"\nversion = \"1.0.0\"\n"),
+    #(
+      "content/index.md",
+      "---\ntitle = \"Welcome home\"\n---\n\n# A small beginning\n\nYour first page is waiting here.\n"
+    ),
+    #(
+      "themes/minimal/layouts/base.html.tuck",
+      "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>{% block title %}{{ page.title }} · {{ site.title }}{% endblock %}</title>\n<style>\n:root{color-scheme:light dark;--paper:#fffef9;--ink:#211c1b}body{max-width:48rem;margin:2rem auto;padding:0 1.25rem;font:1.1rem/1.65 system-ui;background:var(--paper);color:var(--ink)}a{color:inherit;text-underline-offset:.15em}a:focus-visible{outline:2px solid currentColor;outline-offset:3px}header{margin-bottom:2rem}pre{overflow:auto;padding:.75rem;border:1px solid currentColor}code{font-size:.95em}.pagination{display:flex;gap:.75rem;flex-wrap:wrap;align-items:center}.meta{font-size:.9em}li{margin:.5rem 0}@media(prefers-color-scheme:dark){:root{--paper:#211c1b;--ink:#fffef9}}\n</style>\n</head>\n<body>\n<header><a href=\"{{ '/' | relative_url }}\">{{ site.title }}</a></header>\n<main>{% block body %}{% endblock %}</main>\n</body>\n</html>\n"
+    ),
+    #(
+      "themes/minimal/layouts/page.html.tuck",
+      "{% extends \"base.html.tuck\" %}{% block body %}{{ content | safe }}{% endblock %}"
+    ),
+    #(
+      "themes/minimal/layouts/list.html.tuck",
+      "{% extends \"base.html.tuck\" %}{% block body %}<h1>{{ page.title }}</h1>\n{% include \"partials/entries.html.tuck\" %}{% include \"partials/pagination.html.tuck\" %}{% endblock %}"
+    ),
+    #(
+      "themes/minimal/layouts/tag.html.tuck",
+      "{% extends \"base.html.tuck\" %}{% block body %}<h1>{{ tag.name }}</h1>\n<p>{{ tag.count }} {% if tag.count == 1 %}page{% else %}pages{% endif %}</p>\n{% include \"partials/entries.html.tuck\" %}{% include \"partials/pagination.html.tuck\" %}{% endblock %}"
+    ),
+    #(
+      "themes/minimal/layouts/tags.html.tuck",
+      "{% extends \"base.html.tuck\" %}{% block body %}<h1>{{ page.title }}</h1>\n<ul>{% for topic in paginator.items %}<li><a href=\"{{ topic.url }}\">{{ topic.name }}</a> ({{ topic.count }})</li>{% else %}<li>No tags yet.</li>{% endfor %}</ul>\n{% include \"partials/pagination.html.tuck\" %}{% endblock %}"
+    ),
+    #(
+      "themes/minimal/layouts/partials/entries.html.tuck",
+      "<ul>\n{% for item in paginator.items %}<li><a href=\"{{ item.url }}\">{{ item.title }}</a>{% if item.date %} <time class=\"meta\" datetime=\"{{ item.date }}\">{{ item.date }}</time>{% endif %}</li>\n{% else %}<li>No pages yet.</li>\n{% endfor %}</ul>\n"
+    ),
+    #(
+      "themes/minimal/layouts/partials/pagination.html.tuck",
+      "{% if paginator.total_pages > 1 %}\n<nav class=\"pagination\" aria-label=\"Pagination\">\n{% if paginator.previous %}<a href=\"{{ paginator.previous }}\">Previous</a>{% endif %}\n{% for link in paginator.links %}{% if link.gap %}<span aria-hidden=\"true\">…</span>{% endif %}{% if link.current %}<span aria-current=\"page\">{{ link.number }}</span>{% else %}<a href=\"{{ link.url }}\" aria-label=\"Page {{ link.number }}\">{{ link.number }}</a>{% endif %}\n{% endfor %}{% if paginator.next %}<a href=\"{{ paginator.next }}\">Next</a>{% endif %}\n</nav>\n{% endif %}"
+    )
+  ]
+}
+
+/// The CLI gives a first-time author a working post, feed and navigation.
+/// The smaller create API remains useful to embedders and isolated fixtures.
+starter(root: String) -> Result(Nil, String) {
+  let _ = create(root)?
+  let _ = storage.write(
+    path.join([root, "config.toml"]),
+    "title = \"A small beginning\"\nbase-url = \"http://localhost:4000\"\ntheme = \"minimal\"\noutput-dir = \"public\"\n\n[collections.posts]\npath = \"posts\"\nsort = \"date\"\ndirection = \"descending\"\n\n[publishing]\nfeed = true\nsitemap = true\nsearch = true\nrobots = true\n"
+  )?
+  let _ = storage.write(
+    path.join([root, "content/index.md"]),
+    "---\ntitle = \"Welcome home\"\n---\n\n# A small beginning\n\nYour first page is waiting here. Read [your first post](/posts/hello/) or follow the [feed](/feed.xml).\n"
+  )?
+  let _ = storage.write(
+    path.join([root, "content/posts/hello.md"]),
+    "---\ntitle = \"A little room for words\"\ndate = \"" + date.today() + "\"\n---\n\n# A little room for words\n\nThis is your first post. Change this file and Jinks will rebuild it.\n\n```pooka\nmain() {\n  echo \"Hello from Jinks\"\n}\n```\n\n[Back home](/)\n"
+  )?
+  let _ = storage.write(
+    path.join([root, "data/navigation.toml"]),
+    "[[links]]\ntitle = \"Home\"\nurl = \"/\"\n\n[[links]]\ntitle = \"First post\"\nurl = \"/posts/hello/\"\n\n[[links]]\ntitle = \"Feed\"\nurl = \"/feed.xml\"\n"
+  )?
+  let _ = list.try_fold(
+    ["layouts/partials", "static/images", "static/css", "static/js"],
+    Nil,
+    fn(_, directory) {
+      match file.create_directories(path.join([root, directory])) {
+        Ok(_) -> Ok(Nil)
+        Error(error) -> Error(error.path + ": " + error.message)
+      }
+    }
+  )?
+  let base_path = path.join([root, "themes/minimal/layouts/base.html.tuck"])
+  let base = storage.read(base_path)?
+  let base = string.replace(
+    base,
+    "<header><a href=\"{{ '/' | relative_url }}\">{{ site.title }}</a></header>",
+    "<header><a href=\"{{ '/' | relative_url }}\">{{ site.title }}</a><nav aria-label=\"Main\">{% for link in data.navigation.links %}<a href=\"{{ link.url | relative_url }}\">{{ link.title }}</a>{% endfor %}</nav></header>"
+  )
+  let #(before, rest) = match string.split_once(base, "<style>\n") {
+    Some(parts) -> Ok(parts)
+    None -> Error("the embedded theme is missing its stylesheet")
+  }?
+  let #(css, after) = match string.split_once(rest, "</style>") {
+    Some(parts) -> Ok(parts)
+    None -> Error("the embedded theme stylesheet is not closed")
+  }?
+  let css = css + "\nheader{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:1rem}nav{display:flex;gap:1rem;flex-wrap:wrap}\n:root{--syn-keyword:#75618e;--syn-string:#3f7f4f;--syn-number:#b04a12;--syn-comment:#6b625e;--syn-function:#2a6f8f;--syn-error:#b43d30}\n@media(prefers-color-scheme:dark){:root{--syn-keyword:#c2aee0;--syn-string:#9ad6a5;--syn-number:#ffa04a;--syn-comment:#a99c8d;--syn-function:#8cc7e8;--syn-error:#ef917d}}\n.tok-keyword,.tok-type,.t-violet{color:var(--syn-keyword)}.tok-string,.t-pass,.t-diff-add{color:var(--syn-string)}.tok-number,.t-label,.t-dir{color:var(--syn-number)}.tok-comment,.t-dim{color:var(--syn-comment)}.tok-function{color:var(--syn-function)}.t-fail,.t-diff-remove{color:var(--syn-error)}\n"
+  let css = "/* The minimal theme. A site stylesheet at static/css/style.css overrides this file. */\n" + string.replace(
+    css,
+    "}",
+    "}\n"
+  )
+  let _ = storage.write(
+    path.join([root, "themes/minimal/static/css/style.css"]),
+    css
+  )?
+  storage.write(
+    base_path,
+    before + "<link rel=\"stylesheet\" href=\"{{ '/css/style.css' | asset }}\">" + after
+  )
+}

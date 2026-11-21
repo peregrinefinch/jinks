@@ -1,0 +1,302 @@
+// SPDX-License-Identifier: Apache-2.0
+module author_test
+
+import jinks
+import jinks/author
+import jinks/boundary
+import jinks/build
+import jinks/content
+import jinks/date
+import jinks/scaffold
+import jinks/storage
+import poke/should
+import pooka/file
+import pooka/int
+import pooka/path
+import pooka/process
+import pooka/string
+
+site(name: String) -> String {
+  let root = "build/jinks-author/" + int.to_string(process.pid()) + "/" + name
+  let _ = should.be_ok(scaffold.create(root))
+  root
+}
+
+read(root: String, name: String) -> String {
+  should.be_ok(storage.read(path.join([root, name])))
+}
+
+exists(root: String, name: String) -> Bool {
+  should.be_ok(file.exists(path.join([root, name])))
+}
+
+test "new help is available outside a site through every command spelling" {
+  loop args in [
+    ["new", "--help"],
+    ["new", "-h"],
+    ["help", "new"],
+    ["new", "note", "missing-site", "--help"]
+  ] {
+    should.be_true(
+      string.contains(should.be_ok(jinks.command(args)), "--title")
+    )
+  }
+  should.be_true(string.contains(jinks.help(), "new <path>"))
+}
+
+test "new creates nested Markdown drafts without building the site" {
+  let root = site("nested")
+  let message = should.be_ok(
+    jinks.command(
+      ["new", "posts/the-small-hours", root, "--date", "2024-02-29"]
+    )
+  )
+  should.be_true(string.contains(message, "Created draft"))
+  let page = should.be_ok(
+    content.parse(
+      "posts/the-small-hours.md",
+      read(root, "content/posts/the-small-hours.md")
+    )
+  )
+  should.equal(page.title, "the small hours")
+  should.equal(page.published, Some("2024-02-29"))
+  should.be_true(page.draft)
+  should.be_true(
+    string.contains(
+      read(root, "content/posts/the-small-hours.md"),
+      "# the small hours"
+    )
+  )
+  should.be_false(exists(root, "public"))
+}
+
+test "new uses the current validated UTC day when date is omitted" {
+  let root = site("today")
+  let before = date.today()
+  let _ = should.be_ok(jinks.command(["new", "today.md", root]))
+  let after = date.today()
+  let page = should.be_ok(
+    content.parse("today.md", read(root, "content/today.md"))
+  )
+  should.be_true(
+    page.published == Some(before) || page.published == Some(after)
+  )
+}
+
+test "author envelopes round trip quotes, slashes, Unicode, and metadata-shaped titles" {
+  loop title in [
+    "A \"quoted\" title",
+    "C:\\notes\\workshop",
+    "Café beside the 窗",
+    "A title --- draft = false # still a title"
+  ] {
+    let text = should.be_ok(author.source(title, "2024-02-29", None))
+    let page = should.be_ok(content.parse("note.md", text))
+    should.equal(page.title, title)
+    should.be_true(page.draft)
+    should.equal(page.published, Some("2024-02-29"))
+  }
+}
+
+test "an explicit layout is written while omitted layouts inherit collection defaults" {
+  let root = site("defaults")
+  let _ = should.be_ok(storage.write(
+    path.join([root, "config.toml"]),
+    "[collections.posts]\npath = \"posts\"\n[collections.posts.defaults]\nlayout = \"post\"\n"
+  ))
+  let _ = should.be_ok(
+    storage.write(
+      path.join([root, "layouts/post.html.tuck"]),
+      "POST {{ page.title }}"
+    )
+  )
+  let _ = should.be_ok(
+    jinks.command(["new", "posts/hello", root, "--title", "Hello"])
+  )
+  let text = read(root, "content/posts/hello.md")
+  should.be_false(string.contains(text, "layout ="))
+  let _ = should.be_ok(
+    storage.write(
+      path.join([root, "content/posts/hello.md"]),
+      string.replace(text, "draft = true", "draft = false")
+    )
+  )
+  let _ = should.be_ok(build.run(root))
+  should.equal(read(root, "public/posts/hello/index.html"), "POST Hello")
+  let _ = should.be_ok(
+    jinks.command(["new", "other", root, "--layout", "page"])
+  )
+  should.be_true(
+    string.contains(read(root, "content/other.md"), "layout = \"page\"")
+  )
+}
+
+test "drafts stay out of a normal build until explicitly included" {
+  let root = site("visibility")
+  let _ = should.be_ok(jinks.command(["new", "notes/quiet", root]))
+  let _ = should.be_ok(build.run(root))
+  should.be_false(exists(root, "public/notes/quiet/index.html"))
+  let _ = should.be_ok(jinks.command(["build", root, "--drafts"]))
+  should.be_true(exists(root, "public/notes/quiet/index.html"))
+}
+
+test "existing source is preserved and there is no force-overwrite switch" {
+  let root = site("preserved")
+  let _ = should.be_ok(jinks.command(["new", "notes/keep", root]))
+  let original = read(root, "content/notes/keep.md")
+  let error = should.be_error(
+    jinks.command(["new", "notes/keep.md", root, "--title", "Replacement"])
+  )
+  should.be_true(string.contains(error, "refusing to overwrite"))
+  let _ = should.be_error(jinks.command(["new", "notes/keep", root, "--force"]))
+  should.equal(read(root, "content/notes/keep.md"), original)
+}
+
+test "case and Unicode equivalent source names cannot be created twice" {
+  let root = site("equivalent")
+  let _ = should.be_ok(jinks.command(["new", "notes/Café", root]))
+  loop name in ["notes/café.md", "notes/Café.md", "NOTES/CAFÉ.MD"] {
+    let _ = should.be_error(jinks.command(["new", name, root]))
+  }
+}
+
+test "unsafe, hidden, reserved, and non-Markdown paths are rejected without writes" {
+  let root = site("unsafe")
+  loop name in [
+    "../escape",
+    "/escape",
+    "notes/../escape",
+    "notes/./escape",
+    "notes//escape",
+    "notes\\escape",
+    "C:/escape",
+    ".hidden",
+    "notes/.hidden",
+    "CON",
+    "notes/NUL.md",
+    "notes/trailing ",
+    "__jinks/note",
+    "",
+    "notes/",
+    "note.tuck",
+    "note.txt"
+  ] {
+    let _ = should.be_error(jinks.command(["new", name, root]))
+  }
+  should.equal(
+    should.be_ok(file.list_directory(path.join([root, "content"]))),
+    ["index.md"]
+  )
+}
+
+test "invalid title, date, and layout options leave content unchanged" {
+  let root = site("bad-options")
+  loop options in [
+    ["--title", ""],
+    ["--title", "   "],
+    ["--title", "One\nTwo"],
+    ["--title", "One\tTwo"],
+    ["--date", "2023-02-29"],
+    ["--date", "tomorrow"],
+    ["--layout", ""],
+    ["--layout", "../outside"],
+    ["--layout", "/outside"]
+  ] {
+    let _ = should.be_error(
+      jinks.command(["new", "notes/bad", root, ..options])
+    )
+  }
+  should.be_false(exists(root, "content/notes"))
+}
+
+test "new anchors nested and absolute configuration selections beside their content" {
+  let root = site("selected")
+  let nested = path.join([root, "nested"])
+  let _ = should.be_ok(scaffold.create(nested))
+  let _ = should.be_ok(
+    file.rename(
+      path.join([nested, "config.toml"]),
+      path.join([nested, "site.toml"])
+    )
+  )
+  let _ = should.be_ok(
+    jinks.command(["new", "notes/selected", root, "-c", "nested/site.toml"])
+  )
+  should.be_true(exists(nested, "content/notes/selected.md"))
+  should.be_false(exists(root, "content/notes"))
+  let absolute = should.be_ok(path.absolute(path.join([nested, "site.toml"])))
+  let _ = should.be_ok(
+    jinks.command(
+      ["new", "notes/absolute", "missing-root", "--config", absolute]
+    )
+  )
+  should.be_true(exists(nested, "content/notes/absolute.md"))
+}
+
+test "missing or invalid site configuration and extra arguments are errors" {
+  let root = site("arguments")
+  loop args in [
+    ["new"],
+    ["new", "note", root, "extra"],
+    ["new", "note", "missing-site"],
+    ["new", "note", root, "--title"],
+    ["new", "note", root, "--typo"]
+  ] {
+    let _ = should.be_error(jinks.command(args))
+  }
+  let _ = should.be_ok(
+    storage.write(path.join([root, "config.toml"]), "invalid = true")
+  )
+  let _ = should.be_error(jinks.command(["new", "note", root]))
+  should.be_false(exists(root, "content/note.md"))
+}
+
+test "the source boundary uses exclusive creation rather than truncation" {
+  let root = site("exclusive")
+  let _ = should.be_ok(boundary.create(root, "content/exclusive.md", "first"))
+  let _ = should.be_error(
+    boundary.create(root, "content/exclusive.md", "second")
+  )
+  should.equal(read(root, "content/exclusive.md"), "first")
+  let _ = should.be_error(boundary.create(root, "../outside.md", "outside"))
+}
+
+class _LinkReply {}
+
+external _Links from erlang "file" {
+  make_symlink(target: String, name: String) -> _LinkReply
+}
+
+test "authoring refuses dangling links and linked content parents" {
+  let root = site("links")
+  let linked = path.join([root, "content/linked.md"])
+  let _ = _Links.make_symlink("missing.md", linked)
+  should.be_true(
+    string.contains(should.be_error(boundary.tree(linked)), "symbolic links")
+  )
+  let _ = should.be_error(jinks.command(["new", "linked.md", root]))
+  let parent_root = site("linked-parent")
+  let parent = path.join([parent_root, "content/elsewhere"])
+  let _ = _Links.make_symlink("..", parent)
+  should.be_true(
+    string.contains(should.be_error(boundary.tree(parent)), "symbolic links")
+  )
+  let _ = should.be_error(
+    jinks.command(["new", "elsewhere/escape", parent_root])
+  )
+  should.be_false(exists(parent_root, "escape.md"))
+}
+
+test "a missing content directory is created but a regular-file parent is refused" {
+  let root = site("missing-content")
+  let _ = should.be_ok(file.delete(path.join([root, "content/index.md"])))
+  let _ = should.be_ok(file.remove_directory(path.join([root, "content"])))
+  let _ = should.be_ok(jinks.command(["new", "notes/start", root]))
+  should.be_true(exists(root, "content/notes/start.md"))
+  let blocked = site("blocked-parent")
+  let _ = should.be_ok(
+    storage.write(path.join([blocked, "content/blocked"]), "keep")
+  )
+  let _ = should.be_error(jinks.command(["new", "blocked/note", blocked]))
+  should.equal(read(blocked, "content/blocked"), "keep")
+}

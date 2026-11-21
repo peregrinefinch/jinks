@@ -1,0 +1,20 @@
+name = "jinks"
+version = "1.0.0"
+description = "A little mischief for the static web"
+authors = ["Peregrine Finch"]
+licences = ["Apache-2.0"]
+repository = { type = "github", user = "peregrinefinch", repo = "jinks" }
+links = [{ title = "Pooka", href = "https://pooka.run" }]
+
+[dependencies]
+pooka_stdlib = ">= 0.3.1 and < 1.0.0"
+pooka_json = ">= 1.0.0 and < 2.0.0"
+tome = ">= 1.0.0 and < 2.0.0"
+marksy = ">= 1.0.0 and < 2.0.0"
+tuck = ">= 1.0.0 and < 2.0.0"
+arglet = ">= 1.0.0 and < 2.0.0"
+
+[dev-dependencies]
+pooka_httpc = ">= 1.0.0 and < 2.0.0"
+pooka_http = ">= 1.0.0 and < 2.0.0"
+poke = ">= 1.0.0 and < 2.0.0"
