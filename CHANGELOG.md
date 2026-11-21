@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Highlight error and warning labels, source gutters, help, compiler activity, and echo locations in terminal and plain text fences.
+
 ## 1.0.0
 
 - Serve base-path deployments beneath their configured URL prefix, with segment-boundary matching, single decoding and watched retargeting.

@@ -51,18 +51,20 @@ code(source: String, language: String) -> String {
     True -> scan(string.split(source, ""), language, []) |> list.reverse() |> string.join(
       ""
     )
-    False -> match language == "snapshot" || language == "terminal" || (
-      (language == "text" || language == "") && (
-        string.contains(source, "✓") || string.contains(source, "✗") || string.contains(
-          source,
-          "$ "
-        )
-      )
-    ) {
-      True -> string.split(source, "\n") |> list.map(terminal) |> string.join(
-        "\n"
-      )
-      False -> html.escape(source)
+    False -> {
+      let rows = string.split(source, "\n")
+      let plain = language == "text" || language == ""
+      let diagnostic = list.any(rows, fn(line) {
+        diagnostic_kind(string.trim_start(line)) != ""
+      })
+      match True {
+        _ if diagnostic && (plain || language == "terminal") ->
+        diagnostic_lines(rows, "fail", []) |> string.join("\n")
+        _ if language == "snapshot" || language == "terminal" || (
+          plain && list.any(rows, terminal_line)
+        ) -> list.map(rows, terminal) |> string.join("\n")
+        _ -> html.escape(source)
+      }
     }
   }
 }
@@ -158,22 +160,179 @@ quoted(chars: List(String), quote: String, done: List(String)) -> #(
   }
 }
 
-terminal(line: String) -> String {
-  let text = string.trim(line)
-  let kind = match True {
-    _ if string.starts_with(text, "✓") -> "pass"
-    _ if string.starts_with(text, "✗") || string.starts_with(text, "error:") -> "fail"
-    _ if string.starts_with(text, "+ ") || string.contains(text, " + ") -> "diff-add"
-    _ if string.starts_with(text, "- ") || string.contains(text, " - ") -> "diff-remove"
-    _ if string.starts_with(text, "expected") -> "violet"
-    _ if string.starts_with(text, "got ") -> "fail"
-    _ if string.starts_with(text, "•") || string.starts_with(text, "Running") || string.starts_with(
-      text,
-      "Finished"
-    ) -> "label"
-    _ -> "dim"
+/// Diagnostic gutters carry the severity of the preceding headline. Leave
+/// source excerpts and explanatory paragraphs in the normal terminal colour.
+diagnostic_lines(
+  rows: List(String),
+  severity: String,
+  done: List(String)
+) -> List(String) {
+  match rows {
+    [] -> list.reverse(done)
+    [line, ..rest] -> {
+      let text = string.trim_start(line)
+      let kind = diagnostic_kind(text)
+      let active = match kind {
+        "" -> severity
+        _ -> kind
+      }
+      let shown = match kind {
+        "" -> diagnostic_detail(line, text, active)
+        _ -> match string.split_once(text, ":") {
+          Some(#(label, message)) ->
+          html.escape(indentation(line, text)) + terminal_span(kind, label) +
+          terminal_span("bold", ":" + message)
+          None -> html.escape(line)
+        }
+      }
+      diagnostic_lines(rest, active, [shown, ..done])
+    }
   }
-  "<span class=\"t-" + kind + "\">" + html.escape(line) + "</span>"
+}
+
+diagnostic_kind(text: String) -> String {
+  match True {
+    _ if string.starts_with(text, "error: ") -> "fail"
+    _ if string.starts_with(text, "warning: ") -> "msg"
+    _ -> ""
+  }
+}
+
+diagnostic_detail(line: String, text: String, severity: String) -> String {
+  let indent = indentation(line, text)
+  match True {
+    _ if string.starts_with(text, "╭─ ") ->
+    html.escape(indent) + terminal_span("violet", "╭─") + " " +
+    terminal_span("msg", string.slice(text, 3, string.length(text)))
+    _ if text == "╰─" -> html.escape(indent) + terminal_span("violet", text)
+    _ if string.starts_with(text, "help:") || string.starts_with(text, "note:") ->
+    html.escape(indent) + terminal_span("msg", string.slice(text, 0, 5)) +
+    html.escape(string.slice(text, 5, string.length(text)))
+    _ if string.starts_with(text, "Found ") && (
+      string.ends_with(text, " error.") || string.ends_with(text, " errors.") ||
+      string.ends_with(text, " warning.") || string.ends_with(
+        text,
+        " warnings."
+      )
+    ) -> terminal_span("bold", line)
+    _ -> match string.split_once(line, "│") {
+      Some(#(gutter, body)) -> {
+        let marks = string.trim_start(body)
+        let result = match string.trim(gutter) == "" && (
+          string.starts_with(marks, "─") || string.starts_with(marks, "╰─") ||
+          string.starts_with(marks, "┬")
+        ) {
+          True -> html.escape(indentation(body, marks)) + terminal_span(
+            severity,
+            marks
+          )
+          False -> html.escape(body)
+        }
+        terminal_span("violet", gutter + "│") + result
+      }
+      None -> terminal(line)
+    }
+  }
+}
+
+indentation(line: String, trimmed: String) -> String {
+  string.slice(line, 0, string.length(line) - string.length(trimmed))
+}
+
+terminal_span(kind: String, text: String) -> String {
+  "<span class=\"t-" + kind + "\">" + html.escape(text) + "</span>"
+}
+
+is_activity(label: String) -> Bool {
+  list.contains(
+    [
+      "Downloading",
+      "Downloaded",
+      "Compiling",
+      "Compiled",
+      "Running",
+      "Checking",
+      "Checked",
+      "Finished",
+      "Formatted",
+      "Exported",
+      "Publishing",
+      "Published",
+      "Added",
+      "Removed",
+      "Updated",
+      "Generated",
+      "Cleaned"
+    ],
+    label
+  )
+}
+
+terminal_line(line: String) -> Bool {
+  let text = string.trim_start(line)
+  let #(label, _) = first_word(text)
+  is_activity(label) || echo_location(text) ||
+  string.starts_with(text, "$ ") || string.starts_with(text, "✓ ") ||
+  string.starts_with(text, "✗ ") || string.starts_with(text, "• ")
+}
+
+first_word(text: String) -> #(String, String) {
+  match string.split_once(text, " ") {
+    Some(#(word, rest)) -> #(word, " " + rest)
+    None -> #(text, "")
+  }
+}
+
+/// The runtime prints a location on a line of its own before the plain value.
+echo_location(text: String) -> Bool {
+  match string.split_once(text, ".pooka:") {
+    Some(#(path, line)) -> path != "" && line != "" &&
+    list.all(string.split(line, ""), fn(char) {
+      string.contains("0123456789", char)
+    })
+    None -> False
+  }
+}
+
+terminal(line: String) -> String {
+  let text = string.trim_start(line)
+  let indent = html.escape(indentation(line, text))
+  let #(label, rest) = first_word(text)
+  match True {
+    _ if is_activity(label) -> {
+      let detail = match #(label, string.split_once(rest, " in ")) {
+        #("Finished", Some(#(prefix, elapsed))) ->
+        html.escape(prefix + " in ") + terminal_span("dim", elapsed)
+        _ -> html.escape(rest)
+      }
+      indent + terminal_span("label", label) + detail
+    }
+    _ if echo_location(text) -> indent + terminal_span("dim", text)
+    _ if label == "$" -> indent + terminal_span("label", "$") + html.escape(
+      rest
+    )
+    _ if label == "✓" -> indent + terminal_span("pass", label) + html.escape(
+      rest
+    )
+    _ if label == "✗" -> indent + terminal_span("fail", label) + html.escape(
+      rest
+    )
+    _ if label == "•" -> indent + terminal_span("label", label) + html.escape(
+      rest
+    )
+    _ if string.starts_with(text, "+ ") || string.contains(text, " + ") ->
+    terminal_span("diff-add", line)
+    _ if string.starts_with(text, "- ") || string.contains(text, " - ") ->
+    terminal_span("diff-remove", line)
+    _ if label == "expected" ->
+    indent + terminal_span("dim", label) + terminal_span("violet", rest)
+    _ if label == "got" ->
+    indent + terminal_span("dim", label) + terminal_span("fail", rest)
+    _ if string.starts_with(text, "panic:") || string.starts_with(text, "todo:") ||
+    string.starts_with(text, "assertion failed:") ->
+    terminal_span("msg", line)
+    _ -> html.escape(line)
+  }
 }
 
 /// A plain fence becomes a tree only when every nonempty row looks like a

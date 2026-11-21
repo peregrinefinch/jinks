@@ -83,3 +83,81 @@ test "unknown language fences do not accidentally become file trees" {
     "src/\n  main.pooka"
   )
 }
+
+test "plain fences and terminal filters colour each part of a diagnostic" {
+  let source = "error: missing <value>\n   ╭─ src/main.pooka:8:4\n 8 │   value\n   │   ──╰─ add <value>\n   ╰─\n\nhelp: Find the value.\n\nFound 1 error."
+  let #(body, _) = markdown.author("```text\n" + source + "\n```", False)
+  loop output in [body, highlight.render(source, "terminal")] {
+    should.be_true(
+      string.contains(
+        output,
+        "<span class=\"t-fail\">error</span><span class=\"t-bold\">: missing &lt;value&gt;</span>"
+      )
+    )
+    should.be_true(
+      string.contains(output, "<span class=\"t-msg\">src/main.pooka:8:4</span>")
+    )
+    should.be_true(
+      string.contains(output, "<span class=\"t-violet\"> 8 │</span>   value")
+    )
+    should.be_true(
+      string.contains(
+        output,
+        "<span class=\"t-fail\">──╰─ add &lt;value&gt;</span>"
+      )
+    )
+    should.be_true(
+      string.contains(
+        output,
+        "<span class=\"t-msg\">help:</span> Find the value."
+      )
+    )
+    should.be_true(
+      string.contains(output, "<span class=\"t-bold\">Found 1 error.</span>")
+    )
+  }
+}
+
+test "a warning uses amber marks even after an error" {
+  let shown = highlight.render(
+    "error: first\n   │   ──\nwarning: second\n   │   ╰─ a warning",
+    "text"
+  )
+  should.be_true(string.contains(shown, "<span class=\"t-msg\">warning</span>"))
+  should.be_true(
+    string.contains(shown, "<span class=\"t-msg\">╰─ a warning</span>")
+  )
+}
+
+test "compiler labels and echo locations stay distinct from terminal values" {
+  let source = " Compiling app\n  Compiled 1 module in 0.41s\n   Running app.main\nsrc/main.pooka:6\n<value>\n  Finished in 0.12s"
+  let #(shown, _) = markdown.author("```text\n" + source + "\n```", False)
+  should.be_true(
+    string.contains(shown, " <span class=\"t-label\">Compiling</span> app")
+  )
+  should.be_true(
+    string.contains(
+      shown,
+      "<span class=\"t-label\">Compiled</span> 1 module in 0.41s"
+    )
+  )
+  should.be_true(
+    string.contains(shown, "<span class=\"t-label\">Running</span> app.main")
+  )
+  should.be_true(
+    string.contains(
+      shown,
+      "<span class=\"t-dim\">src/main.pooka:6</span>\n&lt;value&gt;"
+    )
+  )
+  should.be_true(
+    string.contains(
+      shown,
+      "<span class=\"t-label\">Finished</span> in <span class=\"t-dim\">0.12s</span>"
+    )
+  )
+  should.equal(
+    highlight.render("src/main.pooka:6\n42", "text"),
+    "<span class=\"t-dim\">src/main.pooka:6</span>\n42"
+  )
+}
