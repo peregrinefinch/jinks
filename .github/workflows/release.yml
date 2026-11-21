@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: Apache-2.0
+name: Release Jinks
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check release version
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("pooka.toml", "rb"))["version"])')
+          test "$GITHUB_REF_NAME" = "v$version"
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "29"
+      - uses: peregrinefinch/setup-pooka@v1
+        with:
+          pooka-version: "0.3.3"
+      - run: pooka test --compact
+      - run: pooka export escript
+      - name: Smoke-test the escript
+        run: |
+          site=$(mktemp -d)/blog
+          escript build/jinks --help
+          escript build/jinks init "$site"
+          escript build/jinks check "$site"
+          escript build/jinks build "$site" --environment production
+          test -s "$site/public/index.html"
+      - name: Publish the release and escript
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" build/jinks --verify-tag --title "Jinks ${GITHUB_REF_NAME#v}" --generate-notes
