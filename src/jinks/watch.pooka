@@ -209,7 +209,7 @@ run_selected(selected: request.Request, host: String, port: Int, live: Bool) -> 
     "::1" -> "[::1]"
     _ -> host
   }
-  let _ = io.println(
+  io.println(
     "   Serving http://" + address + ":" + int.to_string(state.server.port) + server.mount_url(
       state.server.mount
     ) + " (Ctrl-C to stop)"
@@ -225,13 +225,13 @@ wait(state: State) -> Result(String, String) {
     Error(_) -> Error("watch timer failed")
   }?
   let next = tick(state)?
-  let _ = match next.problem != state.problem && next.problem != "" {
+  match next.problem != state.problem && next.problem != "" {
     True -> io.eprintln("error: " + next.problem)
-    False -> Ok(Nil)
+    False -> Nil
   }
-  let _ = match next.revision != state.revision {
+  match next.revision != state.revision {
     True -> io.println("   Rebuilt site")
-    False -> Ok(Nil)
+    False -> Nil
   }
   wait(next)
 }

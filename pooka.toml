@@ -7,7 +7,7 @@ repository = { type = "github", user = "peregrinefinch", repo = "jinks" }
 links = [{ title = "Pooka", href = "https://pooka.run" }]
 
 [dependencies]
-pooka_stdlib = ">= 0.3.1 and < 1.0.0"
+pooka_stdlib = ">= 0.4.1 and < 1.0.0"
 pooka_json = ">= 1.0.0 and < 2.0.0"
 tome = ">= 1.0.0 and < 2.0.0"
 marksy = ">= 1.0.0 and < 2.0.0"
@@ -17,4 +17,4 @@ arglet = ">= 1.0.0 and < 2.0.0"
 [dev-dependencies]
 pooka_httpc = ">= 1.0.0 and < 2.0.0"
 pooka_http = ">= 1.0.0 and < 2.0.0"
-poke = ">= 1.0.0 and < 2.0.0"
+poke = { git = "https://github.com/peregrinefinch/poke.git", rev = "91ef891395ed3308d820bfa22e3b2dba4c39ecc5" }

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Use stdlib 0.4.1 console output in the CLI and live watcher.
+
 - Highlight error and warning labels, source gutters, help, compiler activity, and echo locations in terminal and plain text fences.
 
 ## 1.0.0

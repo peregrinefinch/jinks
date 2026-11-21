@@ -25,11 +25,11 @@ main_with(providers: List(provider.Provider)) {
   match command_with(args, providers) {
     Ok(message) -> {
       let elapsed = time.duration_between(started, time.monotonic_now()).as_milliseconds()
-      let _ = io.println(log.success(message, elapsed, log.colours(args)))
+      io.println(log.success(message, elapsed, log.colours(args)))
       Nil
     }
     Error(message) -> {
-      let _ = io.eprintln("error: " + message)
+      io.eprintln("error: " + message)
       process.exit(1)
     }
   }
