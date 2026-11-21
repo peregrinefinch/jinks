@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.1.0
 
 - Use stdlib 0.4.1 console output in the CLI and live watcher.
 
