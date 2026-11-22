@@ -131,42 +131,43 @@ prepare_timed(selected: request.Request, clock: String) -> Result(
   let library = helpers.install(library, settings, clock, asset_index)?
   let library = helpers.with_samples(library, root)?
   let names = storage.files(path.join([root, "content"]), "")?
-  let source_pages = list.try_fold(names, [], fn(found, name) {
-    match string.ends_with(string.lowercase(name), ".md") || string.ends_with(
-      string.lowercase(name),
-      ".tuck"
-    ) {
-      False -> Ok(found)
-      True -> {
-        let page = content.parse_with_policy(
-          name,
-          storage.read(path.join([root, "content", name]))?,
-          section.find(settings.collections, name),
-          settings.raw_html
-        )?
-        let future = match page.published {
-          None -> False
-          Some(day) -> string.compare(day, today) == Order.Greater
-        }
-        match (!page.draft || settings.build.drafts) && (
-          !future || settings.build.future
-        ) {
-          False -> Ok(found)
-          True -> {
-            let _ = match list.any(found, fn(previous: content.Page) {
-              publish.conflicts(previous.output, page.output)
-            }) {
-              True -> Error(
+  let #(source_pages, _) = list.try_fold(
+    names,
+    #([], publish.empty_paths()),
+    fn(acc, name) {
+      let #(found, outputs) = acc
+      match string.ends_with(string.lowercase(name), ".md") || string.ends_with(
+        string.lowercase(name),
+        ".tuck"
+      ) {
+        False -> Ok(acc)
+        True -> {
+          let page = content.parse_with_policy(
+            name,
+            storage.read(path.join([root, "content", name]))?,
+            section.find(settings.collections, name),
+            settings.raw_html
+          )?
+          let future = match page.published {
+            None -> False
+            Some(day) -> string.compare(day, today) == Order.Greater
+          }
+          match (!page.draft || settings.build.drafts) && (
+            !future || settings.build.future
+          ) {
+            False -> Ok(acc)
+            True -> match publish.track_output(outputs, page.output) {
+              None -> Error(
                 "two pages share an output: " + route.url(page.output)
               )
-              False -> Ok(Nil)
-            }?
-            Ok(list.append(found, page))
+              Some(updated) -> Ok(#([page, ..found], updated))
+            }
           }
         }
       }
     }
-  })?
+  )?
+  let source_pages = list.reverse(source_pages)
   let catalog = collection.prepare(settings.collections, source_pages)?
   let tags = taxonomy.prepare(settings.listings.tags, catalog, source_pages)?
   let collections = taxonomy.collections(tags, catalog, source_pages)

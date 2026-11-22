@@ -66,11 +66,22 @@ test "portable output names reject case and ancestor collisions" {
   loop names in [
     ["Owl/index.html", "owl/index.html"],
     ["app", "app/css"],
+    ["app/css", "APP"],
+    ["café/index.html", "café/index.html"],
     [".JINKS-MANIFEST.JSON"],
     ["../page"]
   ] {
     let _ = should.be_error(publish.validate(names))
   }
+}
+
+test "shared ancestors and similar prefixes do not collide" {
+  assert publish.validate([
+    "app/a.html",
+    "app/b.html",
+    "app.css",
+    "application/index.html"
+  ]) == Ok(Nil)
 }
 
 test "removed pages and assets disappear while unowned binary files survive" {
