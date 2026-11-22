@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Index output paths and manifest ownership so large builds avoid comparing every file with every other file.
+
 ## 1.1.0
 
 - Use stdlib 0.4.1 console output in the CLI and live watcher.

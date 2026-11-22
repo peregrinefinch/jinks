@@ -13,6 +13,7 @@ import pooka/file
 import pooka/json
 import pooka/list
 import pooka/path
+import pooka/set.{Set}
 import pooka/string
 
 manifest() -> String {
@@ -22,7 +23,7 @@ manifest() -> String {
 /// Validate names before touching staging, including case-folded collisions.
 /// This keeps an output built on Unix portable to a Windows checkout.
 validate(names: List(String)) -> Result(Nil, String) {
-  let _ = list.try_fold(names, [], fn(found, name) {
+  let _ = list.try_fold(names, empty_paths(), fn(found, name) {
     let _ = config.relative(name)?
     let _ = match string.lowercase(name) == manifest() || string.starts_with(
       string.lowercase(name),
@@ -31,17 +32,59 @@ validate(names: List(String)) -> Result(Nil, String) {
       True -> Error("reserved output path: " + name)
       False -> Ok(Nil)
     }?
-    match list.any(found, fn(previous) { conflicts(previous, name) }) {
-      True -> Error("output paths collide: " + name)
-      False -> Ok(list.append(found, name))
+    match track_output(found, name) {
+      None -> Error("output paths collide: " + name)
+      Some(updated) -> Ok(updated)
     }
   })?
   Ok(Nil)
 }
 
+/// Index complete files and proper ancestors independently. A path conflicts
+/// with a file above it, a file below it, or another spelling of itself.
+class OutputPaths(files: Set(String), ancestors: Set(String)) {}
+
+empty_paths() -> OutputPaths {
+  OutputPaths(set.empty(), set.empty())
+}
+
+track_output(paths: OutputPaths, name: String) -> Option(OutputPaths) {
+  let key = collision_key(name)
+  let parents = _parents(string.split(key, "/"), "", [])
+  match paths.files.contains(key) || paths.ancestors.contains(key)
+    || list.any(parents, fn(parent) { paths.files.contains(parent) }) {
+    True -> None
+    False -> Some(OutputPaths(
+      paths.files.insert(key),
+      list.fold(parents, paths.ancestors, fn(index, parent) {
+        index.insert(parent)
+      })
+    ))
+  }
+}
+
+_parents(parts: List(String), prefix: String, collected: List(String)) -> List(
+  String
+) {
+  match parts {
+    [] | [_] -> collected
+    [part, ..rest] -> {
+      let next = match prefix {
+        "" -> part
+        _ -> prefix + "/" + part
+      }
+      _parents(rest, next, [next, ..collected])
+    }
+  }
+}
+
+collision_key(name: String) -> String {
+  names.canonical(string.lowercase(names.canonical(name)))
+}
+
 conflicts(left: String, right: String) -> Bool {
-  let left = names.canonical(string.lowercase(names.canonical(left)))
-  let right = names.canonical(string.lowercase(names.canonical(right)))
+  let left = collision_key(left)
+  let right = collision_key(right)
   left == right || string.starts_with(left, right + "/") || string.starts_with(
     right,
     left + "/"
@@ -111,16 +154,14 @@ run(
   )
   let _ = validate(names)?
   boundary.staged(root, output, fn(stage, previous) {
-    let was_owned = owned(previous)?
+    let was_owned = set.from_list(owned(previous)?)
     let existing = match file.is_directory(previous) {
       Ok(True) -> storage.files(previous, "")
       Ok(False) -> Ok([])
       Error(e) -> Error(e.message)
     }?
     let keep = list.filter(existing, fn(name) {
-      name != manifest() && !list.any(was_owned, fn(owned_name) {
-        owned_name == name
-      })
+      name != manifest() && !was_owned.contains(name)
     })
     let _ = list.try_fold(keep, Nil, fn(_, name) {
       let _ = match list.any(names, fn(generated) {
