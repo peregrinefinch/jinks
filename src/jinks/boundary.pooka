@@ -17,6 +17,14 @@ external _Filesystem from erlang "jinks_filesystem" {
 
   guarded(root: String, relative: String) -> Result(Nil, String)
 
+  files(root: String, prefix: String) -> Result(List(String), String)
+
+  staged_files(
+    root: String,
+    relative: String,
+    work: fn(String, String, List(String)) -> Result(Bool, String)
+  ) -> Result(Nil, String)
+
   staged(
     root: String,
     relative: String,
@@ -43,6 +51,22 @@ staged(
 ) -> Result(Nil, String) {
   let _ = config.output_path(relative)?
   _Filesystem.staged(root, relative, work)
+}
+
+/// Inspect and list a directory in one pass, refusing symbolic links.
+files(root: String, prefix: String) -> Result(List(String), String) {
+  _Filesystem.files(root, prefix)
+}
+
+/// Publish from a fresh sibling. The callback may return False when the
+/// previous tree can be kept as it is.
+staged_files(
+  root: String,
+  relative: String,
+  work: fn(String, String, List(String)) -> Result(Bool, String)
+) -> Result(Nil, String) {
+  let _ = config.output_path(relative)?
+  _Filesystem.staged_files(root, relative, work)
 }
 
 /// Create a source file exclusively after checking every existing component.
