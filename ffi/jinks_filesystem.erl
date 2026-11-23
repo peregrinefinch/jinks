@@ -11,7 +11,7 @@
 %% https://www.erlang.org/doc/apps/kernel/file.html#rename/2
 -module(jinks_filesystem).
 -include_lib("kernel/include/file.hrl").
--export([guard_tree/1, guarded/2, staged/3, create_file/3]).
+-export([guard_tree/1, guarded/2, staged/3, staged_files/3, files/2, create_file/3]).
 
 guard_tree(Path) ->
     protect(fun() -> tree(text(Path)), {ok, nil} end).
@@ -57,7 +57,43 @@ create_file(Root, Relative, Content) ->
 %% It may return Error without disturbing the current output. The exclusive
 %% file works across separate BEAM VMs; an interrupted OS process may leave
 %% the lock behind, which is deliberately reported rather than stolen.
+files(Root, Prefix) ->
+    protect(fun() ->
+        Base = filename:join(text(Root), text(Prefix)),
+        directory(Base),
+        {ok, lists:reverse(collect_files(Base, text(Prefix), []))}
+    end).
+
+%% List and validate each entry using the same lstat, keeping the previous
+%% sorted depth-first order and refusing links rather than following them.
+collect_files(Base, Prefix, Found) ->
+    case file:list_dir(Base) of
+        {ok, Names} ->
+            lists:foldl(fun(Name, Acc) ->
+                Path = filename:join(Base, Name),
+                Relative = case Prefix of "" -> Name; _ -> Prefix ++ "/" ++ Name end,
+                case file:read_link_info(Path) of
+                    {ok, #file_info{type = directory}} -> collect_files(Path, Relative, Acc);
+                    {ok, #file_info{type = regular}} ->
+                        [unicode:characters_to_binary(Relative) | Acc];
+                    {ok, #file_info{type = symlink}} ->
+                        fail(["symbolic links are not supported: ", Path]);
+                    {ok, _} -> fail(["special files are not supported: ", Path]);
+                    {error, Reason} -> io_error(Path, Reason)
+                end
+            end, Found, lists:sort(Names));
+        {error, Reason} -> io_error(Base, Reason)
+    end.
+
 staged(Root, Relative, Work) ->
+    staged_files(Root, Relative, fun(Stage, Previous, _) ->
+        case Work(Stage, Previous) of
+            {ok, nil} -> {ok, true};
+            {error, _} = Error -> Error
+        end
+    end).
+
+staged_files(Root, Relative, Work) ->
     protect(fun() ->
         Base = filename:absname(text(Root)),
         directory(Base),
@@ -80,10 +116,10 @@ staged(Root, Relative, Work) ->
     end).
 
 locked(Output, Work) ->
-    tree(Output),
-    case file:read_link_info(Output) of
-        {ok, #file_info{type = directory}} -> ok;
-        {error, enoent} -> ok;
+    Existing = case file:read_link_info(Output) of
+        {ok, #file_info{type = directory}} -> lists:reverse(collect_files(Output, "", []));
+        {error, enoent} -> [];
+        {ok, #file_info{type = symlink}} -> fail(["symbolic links are not supported: ", Output]);
         {ok, _} -> fail("output must be a directory");
         {error, Reason} -> io_error(Output, Reason)
     end,
@@ -94,8 +130,9 @@ locked(Output, Work) ->
     Backup = filename:join(Parent, ".jinks-backup-" ++ Token),
     ensure(file:make_dir(Stage), Stage),
     try
-        case Work(unicode:characters_to_binary(Stage), unicode:characters_to_binary(Output)) of
-            {ok, nil} ->
+        case Work(unicode:characters_to_binary(Stage), unicode:characters_to_binary(Output), Existing) of
+            {ok, false} -> {ok, nil};
+            {ok, true} ->
                 tree(Stage),
                 publish(Stage, Output, Backup),
                 {ok, nil};

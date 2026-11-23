@@ -109,6 +109,42 @@ test "removed pages and assets disappear while unowned binary files survive" {
   quiet(root)
 }
 
+external _Times from erlang "filelib" {
+  last_modified(path: String) -> #(#(Int, Int, Int), #(Int, Int, Int))
+}
+
+test "identical publication keeps existing files and changed output is staged" {
+  let root = site("unchanged")
+  let _ = should.be_ok(file.create_directories(path.join([root, "static"])))
+  let asset = path.join([root, "static/asset.bin"])
+  let _ = should.be_ok(file.write_bytes(asset, <<0, 255>>))
+  let pages = [#("index.html", "first")]
+  let assets = [#("asset.bin", asset)]
+  let page = path.join([root, "public/index.html"])
+  let _ = should.be_ok(publish.run(root, "public", pages, assets))
+  let marker = #(#(2000, 1, 1), #(0, 0, 0))
+  let _ = _Links.change_time(page, marker)
+  should.equal(_Times.last_modified(page), marker)
+  write(root, "public/unowned.txt", "keep")
+  let _ = should.be_ok(publish.run(root, "public", pages, assets))
+  should.equal(_Times.last_modified(page), marker)
+  should.equal(read(root, "public/unowned.txt"), "keep")
+
+  let _ = should.be_ok(file.write_bytes(asset, <<1, 2>>))
+  let _ = should.be_ok(publish.run(root, "public", pages, assets))
+  should.equal(
+    should.be_ok(file.read_bytes(path.join([root, "public/asset.bin"]))),
+    <<1, 2>>
+  )
+  let _ = should.be_ok(
+    publish.run(root, "public", [#("index.html", "changed")], [])
+  )
+  should.equal(read(root, "public/index.html"), "changed")
+  should.be_false(exists(root, "public/asset.bin"))
+  should.equal(read(root, "public/unowned.txt"), "keep")
+  quiet(root)
+}
+
 test "new generated files cannot claim an unowned output path" {
   let root = site("unowned")
   let _ = should.be_ok(build.run(root))
@@ -238,6 +274,8 @@ class _LinkReply {}
 
 external _Links from erlang "file" {
   make_symlink(target: String, name: String) -> _LinkReply
+
+  change_time(path: String, time: #(#(Int, Int, Int), #(Int, Int, Int))) -> _LinkReply
 }
 
 link(target: String, name: String) {

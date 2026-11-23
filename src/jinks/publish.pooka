@@ -153,13 +153,8 @@ run(
     list.map(assets, fn(asset) { asset.0 })
   )
   let _ = validate(names)?
-  boundary.staged(root, output, fn(stage, previous) {
+  boundary.staged_files(root, output, fn(stage, previous, existing) {
     let was_owned = set.from_list(owned(previous)?)
-    let existing = match file.is_directory(previous) {
-      Ok(True) -> storage.files(previous, "")
-      Ok(False) -> Ok([])
-      Error(e) -> Error(e.message)
-    }?
     let keep = list.filter(existing, fn(name) {
       name != manifest() && !was_owned.contains(name)
     })
@@ -170,16 +165,59 @@ run(
         True -> Error("refusing to overwrite an unowned output file: " + name)
         False -> Ok(Nil)
       }?
-      copy(path.join([previous, name]), path.join([stage, name]))
+      Ok(Nil)
     })?
-    let _ = list.try_fold(pages, Nil, fn(_, page) {
-      storage.write(path.join([stage, page.0]), page.1)
-    })?
-    let _ = list.try_fold(assets, Nil, fn(_, asset) {
-      copy(asset.1, path.join([stage, asset.0]))
-    })?
-    storage.write(path.join([stage, manifest()]), encode(names))
+    match _unchanged(previous, names, was_owned, pages, assets)? {
+      True -> Ok(False)
+      False -> {
+        let _ = list.try_fold(keep, Nil, fn(_, name) {
+          copy(path.join([previous, name]), path.join([stage, name]))
+        })?
+        let _ = list.try_fold(pages, Nil, fn(_, page) {
+          storage.write(path.join([stage, page.0]), page.1)
+        })?
+        let _ = list.try_fold(assets, Nil, fn(_, asset) {
+          copy(asset.1, path.join([stage, asset.0]))
+        })?
+        let _ = storage.write(path.join([stage, manifest()]), encode(names))?
+        Ok(True)
+      }
+    }
   })
+}
+
+_unchanged(
+  previous: String,
+  names: List(String),
+  was_owned: Set(String),
+  pages: List(#(String, String)),
+  assets: List(#(String, String))
+) -> Result(Bool, String) {
+  // The manifest must exist, even for an empty site. A matching set keeps
+  // stale generated paths from surviving a no-op publication.
+  let manifest_matches = file.is_file(path.join([previous, manifest()])) == Ok(
+    True
+  )
+    && was_owned.size() == list.length(names)
+    && list.all(names, fn(name) { was_owned.contains(name) })
+  // Clock-dependent exports are appended after content. Check them first
+  // so a changed feed can go straight to staging.
+  let pages_match = manifest_matches && list.all(list.reverse(pages), fn(page) {
+    storage.read(path.join([previous, page.0])) == Ok(page.1)
+  })
+  match pages_match {
+    False -> Ok(False)
+    True -> list.try_fold(assets, True, fn(matching, asset) {
+      let _ = boundary.tree(asset.1)?
+      let same = match file.read_bytes(asset.1) {
+        Ok(bytes) -> file.read_bytes(path.join([previous, asset.0])) == Ok(
+          bytes
+        )
+        Error(_) -> False
+      }
+      Ok(matching && same)
+    })
+  }
 }
 
 copy(source: String, destination: String) -> Result(Nil, String) {

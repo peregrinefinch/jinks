@@ -6,8 +6,8 @@ module storage
 
 import jinks/boundary
 import pooka/file
-import pooka/path
 import pooka/list
+import pooka/path
 
 read(name: String) -> Result(String, String) {
   match file.read(name) {
@@ -29,18 +29,7 @@ write(name: String, text: String) -> Result(Nil, String) {
 
 /// Enumerate files only. Sorting is independent of filesystem iteration order.
 files(root: String, prefix: String) -> Result(List(String), String) {
-  let _ = boundary.tree(path.join([root, prefix]))?
-  _files(root, prefix)
-}
-
-// The public entry validates the tree once; recursion must not rescan every
-// subtree at each level of a deep content directory.
-_files(root: String, prefix: String) -> Result(List(String), String) {
-  let names = match file.list_directory(path.join([root, prefix])) {
-    Ok(names) -> Ok(names)
-    Error(e) -> Error(e.path + ": " + e.message)
-  }?
-  walk(root, prefix, list.sort(names), [])
+  boundary.files(root, prefix)
 }
 
 walk(root: String, prefix: String, names: List(String), found: List(String)) -> Result(
@@ -59,7 +48,7 @@ walk(root: String, prefix: String, names: List(String), found: List(String)) -> 
         Error(e) -> Error(e.path + ": " + e.message)
       }?
       let entries = match nested {
-        True -> _files(root, relative)
+        True -> files(root, relative)
         False -> Ok([relative])
       }?
       walk(root, prefix, rest, list.concat(found, entries))

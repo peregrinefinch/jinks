@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Skip replacing byte-identical output and list existing files while checking the publication boundary.
+
 - Index output paths and manifest ownership so large builds avoid comparing every file with every other file.
 
 ## 1.1.0
